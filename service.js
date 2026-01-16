@@ -185,3 +185,14 @@ setInterval(tickSync, SYNC_INTERVAL_MS);
 // first run immediately
 tickMatch();
 tickSync();
+// ===== keep Render happy (dummy http server) =====
+import http from "http";
+
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("matchmaker running\n");
+}).listen(PORT, () => {
+  console.log("HTTP server listening on", PORT);
+});
