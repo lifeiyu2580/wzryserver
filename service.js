@@ -307,34 +307,52 @@ async function syncMatchStatuses() {
   }
 }
 
+const lastCheck = new Map(); // wallet -> count
+
 async function fixQueueInconsistency() {
-  // 修复你这次遇到的：DB=matched 但链上 inMatch=false / inQueue=true
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("queue")
     .select("wallet,status")
-    .in("status", ["matched", "locking"])
-    .order("updated_at", { ascending: true })
-    .limit(QUEUE_FIX_BATCH);
+    .in("status", ["matched","locking","cancelled"]);
 
-  if (error) throw error;
-  if (!data || data.length === 0) return;
+  if (!data) return;
 
   for (const row of data) {
-    const w = lc(row.wallet);
-    const [im, iq] = await Promise.all([contract.inMatch(w), contract.inQueue(w)]);
+    const w = row.wallet.toLowerCase();
 
-    // 以链上为准纠偏
-    let want;
-    if (im) want = "matched";
-    else if (iq) want = "queued";
-    else want = "cancelled";
+    let im, iq;
+    try {
+      [im, iq] = await Promise.all([
+        contract.inMatch(w),
+        contract.inQueue(w)
+      ]);
+    } catch (e) {
+      console.log("[sync] rpc fail skip", w);
+      continue; // RPC 失败直接跳过
+    }
 
-    if (row.status !== want) {
-      console.log("[sync] fix queue", w, row.status, "->", want, `(onchain inMatch=${im} inQueue=${iq})`);
-      await setQueueStatus(w, want);
+    if (!im && !iq) {
+      const c = (lastCheck.get(w) || 0) + 1;
+      lastCheck.set(w, c);
+
+      if (c < 2) {
+        console.log("[sync] wait confirm", w);
+        continue;
+      }
+
+      console.log("[sync] confirmed cancelled", w);
+      await setQueueStatus(w, "cancelled");
+    } else {
+      lastCheck.delete(w);
+      const want = im ? "matched" : "queued";
+      if (row.status !== want) {
+        console.log("[sync] fix", w, row.status, "->", want);
+        await setQueueStatus(w, want);
+      }
     }
   }
 }
+
 
 async function tickSync() {
   if (syncBusy) return;
