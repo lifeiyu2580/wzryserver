@@ -245,37 +245,56 @@ async function scanMatchLockedEvents() {
 
   let last = await getLastBlock();
   if (!last || last <= 0) {
-    // 首次启动，回扫一段区块以补写“之前漏写”的 matches
+    // 首次启动，回扫一段区块
     last = Math.max(0, latest - EVENT_SCAN_BLOCKS);
     await setLastBlock(last);
   }
 
-  const fromBlock = last + 1;
-  if (fromBlock > latest) return;
+  let from = last + 1;
+  if (from > latest) return;
 
   const filter = contract.filters.MatchLocked();
-  const logs = await contract.queryFilter(filter, fromBlock, latest);
 
-  if (logs.length > 0) {
-    console.log("[sync] MatchLocked logs:", logs.length, "range:", fromBlock, "-", latest);
-  }
+  // ⚠️ RPC 限制：单次 getLogs 最大区块跨度 50000
+  // 我们保守点：每次扫 40000
+  const STEP = Number(process.env.EVENT_SCAN_STEP || 40000);
 
-  for (const ev of logs) {
-    const matchId = Number(ev.args.matchId);
-    const a = lc(ev.args.a);
-    const b = lc(ev.args.b);
+  while (from <= latest) {
+    const to = Math.min(latest, from + STEP);
 
+    let logs = [];
     try {
-      await upsertMatchFromChain(matchId, a, b, "locked");
-      // 只要链上锁过，就把两人标成 matched（链上 inMatch 应为 true）
-      await markMatched(a, b);
+      logs = await contract.queryFilter(filter, from, to);
     } catch (e) {
-      console.error("[sync] event upsert failed:", matchId, e?.message || e);
+      console.error("[sync] getLogs failed range", from, to, e?.message || e);
+      // 这段失败就别推进 last_block，等下次再试
+      return;
     }
-  }
 
-  await setLastBlock(latest);
+    if (logs.length > 0) {
+      console.log("[sync] MatchLocked logs:", logs.length, "range:", from, "-", to);
+    }
+
+    for (const ev of logs) {
+      const matchId = Number(ev.args.matchId);
+      const a = lc(ev.args.a);
+      const b = lc(ev.args.b);
+
+      try {
+        await upsertMatchFromChain(matchId, a, b, "locked");
+        await markMatched(a, b);
+      } catch (e) {
+        console.error("[sync] event upsert failed:", matchId, e?.message || e);
+      }
+    }
+
+    // ✅ 这段范围成功扫完，推进 last_block 到 to
+    await setLastBlock(to);
+
+    from = to + 1;
+  }
 }
+
 
 async function syncMatchStatuses() {
   const { data, error } = await supabase
