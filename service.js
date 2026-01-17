@@ -244,9 +244,13 @@ async function scanMatchLockedEvents() {
   const latest = await provider.getBlockNumber();
 
   let last = await getLastBlock();
+
+  const STEP = Number(process.env.EVENT_SCAN_STEP || 40000);
+  const PRUNED_WINDOW = Number(process.env.PRUNED_WINDOW || 40000);
+
+  // 首次启动：不要扫很老，直接从最近窗口开始
   if (!last || last <= 0) {
-    // 首次启动，回扫一段区块
-    last = Math.max(0, latest - EVENT_SCAN_BLOCKS);
+    last = Math.max(0, latest - PRUNED_WINDOW);
     await setLastBlock(last);
   }
 
@@ -255,10 +259,6 @@ async function scanMatchLockedEvents() {
 
   const filter = contract.filters.MatchLocked();
 
-  // ⚠️ RPC 限制：单次 getLogs 最大区块跨度 50000
-  // 我们保守点：每次扫 40000
-  const STEP = Number(process.env.EVENT_SCAN_STEP || 40000);
-
   while (from <= latest) {
     const to = Math.min(latest, from + STEP);
 
@@ -266,8 +266,17 @@ async function scanMatchLockedEvents() {
     try {
       logs = await contract.queryFilter(filter, from, to);
     } catch (e) {
+      const msg = (e?.shortMessage || e?.message || "").toLowerCase();
+
+      // pruned 节点：老区块查不到 logs，直接跳到最近窗口
+      if (msg.includes("pruned")) {
+        const newLast = Math.max(0, latest - PRUNED_WINDOW);
+        console.error("[sync] pruned logs; jump last_block to", newLast);
+        await setLastBlock(newLast);
+        return;
+      }
+
       console.error("[sync] getLogs failed range", from, to, e?.message || e);
-      // 这段失败就别推进 last_block，等下次再试
       return;
     }
 
@@ -283,18 +292,15 @@ async function scanMatchLockedEvents() {
       try {
         await upsertMatchFromChain(matchId, a, b, "locked");
         await markMatched(a, b);
-      } catch (e) {
-        console.error("[sync] event upsert failed:", matchId, e?.message || e);
+      } catch (err) {
+        console.error("[sync] event upsert failed:", matchId, err?.message || err);
       }
     }
 
-    // ✅ 这段范围成功扫完，推进 last_block 到 to
     await setLastBlock(to);
-
     from = to + 1;
   }
 }
-
 
 async function syncMatchStatuses() {
   const { data, error } = await supabase
