@@ -478,6 +478,118 @@ async function handle(req, res) {
       res.writeHead(200, { "Content-Type": "text/plain" });
       return res.end("matchmaker running\n");
     }
+    if (req.method === "POST" && path === "/api/profile/set_once") {
+  const { wallet: w, gameName, message, signature } = await readJson(req);
+
+  if (!w || !gameName || !message || !signature) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet/gameName/message/signature" }));
+  }
+
+  const wallet = lc(w);
+  const name = String(gameName).trim();
+
+  if (name.length < 1 || name.length > 30) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "gameName length must be 1~30" }));
+  }
+
+  // message 格式固定，防复用
+  const lines = String(message).split("\n").map(s => s.trim()).filter(Boolean);
+  if (lines[0] !== "WZRY_SET_NAME_ONCE") {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "bad message header" }));
+  }
+  const kv = {};
+  for (const line of lines.slice(1)) {
+    const idx = line.indexOf(":");
+    if (idx > 0) kv[line.slice(0, idx).toLowerCase()] = line.slice(idx + 1);
+  }
+
+  const msgWallet = lc(kv.wallet || "");
+  const msgName = String(kv.name || "").trim();
+  const ts = Number(kv.ts || 0);
+  const origin = String(kv.origin || "");
+  const msgContract = lc(kv.contract || "");
+
+  if (msgWallet !== wallet || msgName !== name || msgContract !== CONTRACT_ADDRESS || !ts || !origin) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "message mismatch" }));
+  }
+
+  // 时间窗：5分钟
+  const now = Date.now();
+  if (Math.abs(now - ts) > 5 * 60 * 1000) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "signature expired" }));
+  }
+
+  // 验签
+  let recovered;
+  try {
+    recovered = ethers.verifyMessage(message, signature);
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "bad signature" }));
+  }
+  if (lc(recovered) !== wallet) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "signature not from wallet" }));
+  }
+
+  // 已存在则不可更改
+  const { data: exist, error: e1 } = await supabase
+    .from("player_profiles")
+    .select("wallet,game_name")
+    .eq("wallet", wallet)
+    .maybeSingle();
+
+  if (e1) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: e1.message }));
+  }
+  if (exist) {
+    res.writeHead(409, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "name already set and cannot be changed" }));
+  }
+
+  // 只 insert（我们表的 RLS 也只允许 insert）
+  const { error: insErr } = await supabase
+    .from("player_profiles")
+    .insert({ wallet, game_name: name });
+
+  if (insErr) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: insErr.message }));
+  }
+
+  await logEvent("set_name_once", { name, origin, ts }, wallet);
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ ok: true, gameName: name }));
+}
+
+if (req.method === "GET" && path === "/api/profile/get") {
+  const w = lc(u.searchParams.get("wallet") || "");
+  if (!w) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+  }
+
+  const { data, error } = await supabase
+    .from("player_profiles")
+    .select("wallet,game_name,created_at")
+    .eq("wallet", w)
+    .maybeSingle();
+
+  if (error) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: error.message }));
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ ok: true, profile: data || null }));
+}
 
     if (req.method === "POST" && path === "/api/queue/enqueue") {
       const { wallet: w, txHash } = await readJson(req);
@@ -543,7 +655,42 @@ async function handle(req, res) {
       if (mErr) throw mErr;
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, queue: q || null, match: (ms && ms[0]) || null }));
+      // ---- NEW: my profile ----
+      const { data: meProf, error: meErr } = await supabase
+        .from("player_profiles")
+        .select("wallet,game_name")
+        .eq("wallet", w)
+        .maybeSingle();
+
+      if (meErr) throw meErr;
+      // ---- NEW: opponent profile (if match exists) ----
+      let oppProf = null;
+
+      const m = (ms && ms[0]) ? ms[0] : null; // 你 matches 查询一般存在 ms 变量
+      if (m) {
+        const a = lc(m.player_a);
+        const b = lc(m.player_b);
+        const oppWallet = (a === w) ? b : a;
+
+        const { data: o, error: oErr } = await supabase
+          .from("player_profiles")
+          .select("wallet,game_name")
+          .eq("wallet", oppWallet)
+          .maybeSingle();
+
+        if (oErr) throw oErr;
+        oppProf = o || null;
+      }
+
+
+      return res.end(JSON.stringify({
+        ok: true,
+        queue: q || null,
+        match: (ms && ms[0]) || null,
+        meProfile: meProf || null,
+        opponentProfile: oppProf
+      }));
+
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
