@@ -1,7 +1,14 @@
+// service.js (drop-in replacement)
+// - Works with ONLY 3 tables: queue, matches, events
+// - No RPC required, no chain_sync_state required
+// - Provides simple HTTP APIs for frontend write requests
+// - Runs matchmaker loop + chain sync loop
+
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { ethers } from "ethers";
 import http from "http";
+import { URL } from "url";
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -16,10 +23,12 @@ const CONTRACT_ADDRESS = mustEnv("CONTRACT_ADDRESS").toLowerCase();
 const OPERATOR_PRIVATE_KEY = mustEnv("OPERATOR_PRIVATE_KEY");
 
 const MATCH_INTERVAL_MS = Number(process.env.MATCH_INTERVAL_MS || 3000);
-const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 60000);
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS || 8000);
 const SYNC_BATCH = Number(process.env.SYNC_BATCH || 50);
-const EVENT_SCAN_BLOCKS = Number(process.env.EVENT_SCAN_BLOCKS || 2000); // 初次启动回扫多少块
-const QUEUE_FIX_BATCH = Number(process.env.QUEUE_FIX_BATCH || 50);
+
+// 每次同步从最近窗口扫 MatchLocked（避免需要 chain_sync_state 表）
+const EVENT_SCAN_STEP = Number(process.env.EVENT_SCAN_STEP || 20000);
+const PRUNED_WINDOW = Number(process.env.PRUNED_WINDOW || 60000); // 最近多少块
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -38,117 +47,142 @@ const provider = new ethers.JsonRpcProvider(RPC_URL, undefined, {
 const wallet = new ethers.Wallet(OPERATOR_PRIVATE_KEY, provider);
 const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
+function lc(addr) { return (addr || "").toLowerCase(); }
+function nowIso() { return new Date().toISOString(); }
+
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function lc(addr) { return (addr || "").toLowerCase(); }
+async function logEvent(type, payload = {}, walletAddr = null, matchId = null) {
+  try {
+    await supabase.from("events").insert({
+      type,
+      wallet: walletAddr ? lc(walletAddr) : null,
+      match_id: matchId ?? null,
+      contract_address: CONTRACT_ADDRESS,
+      payload
+    });
+  } catch {}
+}
 
-// ===== DB helpers =====
-async function claimTwoPlayers() {
-  const { data, error } = await supabase.rpc("claim_two_players");
+// ---------------------------
+// DB helpers (new schema)
+// queue: wallet, contract_address, status, enqueue_tx, leave_tx, created_at, updated_at
+// matches: contract_address, chain_match_id, player_a, player_b, status, winner, dispute_by, created_at, updated_at
+// ---------------------------
+
+async function upsertQueue(walletAddr, patch) {
+  const payload = {
+    wallet: lc(walletAddr),
+    contract_address: CONTRACT_ADDRESS,
+    updated_at: nowIso(),
+    ...patch
+  };
+
+  const { error } = await supabase
+    .from("queue")
+    .upsert(payload, { onConflict: "wallet,contract_address" });
+
   if (error) throw error;
-  if (!data || data.length === 0) return null;
+}
 
-  // 你函数返回字段名可能是 a_wallet/b_wallet 或 a/b，这里兼容一下
-  const row = data[0];
-  const a = lc(row.a_wallet || row.a);
-  const b = lc(row.b_wallet || row.b);
-  if (!a || !b) return null;
+async function updateQueue(walletAddr, patch) {
+  const { error } = await supabase
+    .from("queue")
+    .update({ ...patch, updated_at: nowIso() })
+    .eq("wallet", lc(walletAddr))
+    .eq("contract_address", CONTRACT_ADDRESS);
+
+  if (error) throw error;
+}
+
+async function markQueueMatched(a, b) {
+  const { error } = await supabase
+    .from("queue")
+    .update({ status: "matched", updated_at: nowIso() })
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .in("wallet", [lc(a), lc(b)])
+    .in("status", ["queued", "pending_enqueue"]); // 保险：避免误伤 cancelled/pending_leave
+
+  if (error) throw error;
+}
+
+async function rollbackQueueToQueued(a, b) {
+  const { error } = await supabase
+    .from("queue")
+    .update({ status: "queued", updated_at: nowIso() })
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .in("wallet", [lc(a), lc(b)])
+    .in("status", ["matched"]); // 只回滚我们刚刚 claim 的
+
+  if (error) throw error;
+}
+
+async function upsertMatch(matchId, a, b, statusText, extra = {}) {
+  const payload = {
+    contract_address: CONTRACT_ADDRESS,
+    chain_match_id: Number(matchId),
+    player_a: lc(a),
+    player_b: lc(b),
+    status: statusText,
+    updated_at: nowIso(),
+    ...extra
+  };
+
+  const { error } = await supabase
+    .from("matches")
+    .upsert(payload, { onConflict: "contract_address,chain_match_id" });
+
+  if (error) throw error;
+}
+
+async function updateMatch(matchId, patch) {
+  const { error } = await supabase
+    .from("matches")
+    .update({ ...patch, updated_at: nowIso() })
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("chain_match_id", Number(matchId));
+
+  if (error) throw error;
+}
+
+// “在 DB 里选 2 个 queued，尽量原子 claim（单实例够用）”
+async function claimTwoPlayers() {
+  // 取最早的 2 个 queued
+  const { data: rows, error } = await supabase
+    .from("queue")
+    .select("wallet,status,created_at")
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("status", "queued")
+    .order("created_at", { ascending: true })
+    .limit(2);
+
+  if (error) throw error;
+  if (!rows || rows.length < 2) return null;
+
+  const a = lc(rows[0].wallet);
+  const b = lc(rows[1].wallet);
+
+  // 把这两个人标为 matched，避免下一个 tick 又拿到（这里用 status=queued 限制）
+  const { data: upd, error: uerr } = await supabase
+    .from("queue")
+    .update({ status: "matched", updated_at: nowIso() })
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .in("wallet", [a, b])
+    .eq("status", "queued")
+    .select("wallet");
+
+  if (uerr) throw uerr;
+
+  // 如果更新不到 2 行，说明被别的流程抢了（或状态变了）
+  if (!upd || upd.length < 2) return null;
 
   return { a, b };
 }
 
-async function rollbackQueueToQueued(a, b) {
-  await supabase
-    .from("queue")
-    .update({ status: "queued", updated_at: new Date().toISOString() })
-    .in("wallet", [a, b]);
-}
+// ---------------------------
+// Chain helpers
+// ---------------------------
 
-async function setQueueStatus(walletAddr, status) {
-  await supabase
-    .from("queue")
-    .update({ status, updated_at: new Date().toISOString() })
-    .eq("wallet", walletAddr);
-}
-
-async function upsertMatchFromChain(matchId, a, b, statusText) {
-  const payload = {
-    chain_match_id: Number(matchId),
-    a_wallet: lc(a),
-    b_wallet: lc(b),
-    status: statusText,
-    contract_address: CONTRACT_ADDRESS
-  };
-
-  // upsert: 如果你 matches 没 unique 约束，会插重复；建议你在 (contract_address, chain_match_id) 上做 unique
-  // 这里先用 “先查再插/更” 的方式，避免表结构没改导致 upsert 报错。
-  const { data: existing, error: qerr } = await supabase
-    .from("matches")
-    .select("id,status")
-    .eq("contract_address", CONTRACT_ADDRESS)
-    .eq("chain_match_id", Number(matchId))
-    .limit(1);
-
-  if (qerr) throw qerr;
-
-  if (!existing || existing.length === 0) {
-    const { error: ierr } = await supabase.from("matches").insert(payload);
-    if (ierr) throw ierr;
-  } else {
-    // 状态不一样才更新，减少写库
-    if (existing[0].status !== statusText) {
-      const { error: uerr } = await supabase
-        .from("matches")
-        .update({ status: statusText })
-        .eq("id", existing[0].id);
-      if (uerr) throw uerr;
-    }
-  }
-}
-
-async function markMatched(a, b) {
-  // 注意：只允许在链上确定 lockMatch 成功后调用
-  const { error } = await supabase
-    .from("queue")
-    .update({ status: "matched", updated_at: new Date().toISOString() })
-    .in("wallet", [a, b]);
-  if (error) throw error;
-}
-
-async function updateMatchStatus(matchId, statusText) {
-  await supabase
-    .from("matches")
-    .update({ status: statusText })
-    .eq("chain_match_id", Number(matchId))
-    .eq("contract_address", CONTRACT_ADDRESS);
-}
-
-// ===== chain sync state =====
-async function getLastBlock() {
-  const { data, error } = await supabase
-    .from("chain_sync_state")
-    .select("last_block")
-    .eq("contract_address", CONTRACT_ADDRESS)
-    .limit(1);
-
-  if (error) throw error;
-
-  if (!data || data.length === 0) return 0;
-  return Number(data[0].last_block || 0);
-}
-
-async function setLastBlock(lastBlock) {
-  const payload = {
-    contract_address: CONTRACT_ADDRESS,
-    last_block: Number(lastBlock),
-    updated_at: new Date().toISOString()
-  };
-  // 用 upsert 需要表有 pk(contract_address)，我们建表时就是 pk
-  const { error } = await supabase.from("chain_sync_state").upsert(payload);
-  if (error) throw error;
-}
-
-// ===== Extract matchId from receipt (A: 实时写库) =====
 function extractMatchLocked(receipt) {
   for (const log of receipt.logs || []) {
     try {
@@ -165,70 +199,84 @@ function extractMatchLocked(receipt) {
   return null;
 }
 
-// ===== MATCH LOOP (A) =====
+function mapChainStatusToText(st) {
+  // 你合约注释：1 locked,2 disputed,3 settled,4 cancelled
+  // 我们表里是 locking/playing/disputed/resolved
+  if (st === 1) return "locking";
+  if (st === 2) return "disputed";
+  if (st === 3) return "resolved";
+  if (st === 4) return "resolved"; // 取消也归到 resolved（你也可以以后加 cancelled 状态）
+  return "locking";
+}
+
+// ---------------------------
+// MATCH LOOP
+// ---------------------------
+
 let matchBusy = false;
 async function tickMatch() {
   if (matchBusy) return;
   matchBusy = true;
 
   try {
-    // RPC health check
-    await provider.getBlockNumber();
+    await provider.getBlockNumber(); // RPC health
 
     const pair = await claimTwoPlayers();
-    if (!pair) {
-      // console.log("[match] <2 queued");
-      return;
-    }
+    if (!pair) return;
 
     const { a, b } = pair;
-    console.log("[match] got pair:", a, b);
+    console.log("[match] claimed pair:", a, b);
+    await logEvent("claim_pair", { a, b });
 
-    // 可选：防止 DB 里 queued 但链上已退款/不在队列
+    // 可选链上校验：DB queued 但链上不在队列，直接纠偏
     const [aq, bq] = await Promise.all([contract.inQueue(a), contract.inQueue(b)]);
     if (!aq) {
-      console.log("[match] a not inQueue onchain -> set cancelled in DB:", a);
-      await setQueueStatus(a, "cancelled");
-      // 把 b 放回 queued（避免被锁在 locking）
-      await setQueueStatus(b, "queued");
+      await updateQueue(a, { status: "cancelled" });
+      await updateQueue(b, { status: "queued" });
+      await logEvent("claim_pair_onchain_miss", { who: "a", a, b });
       return;
     }
     if (!bq) {
-      console.log("[match] b not inQueue onchain -> set cancelled in DB:", b);
-      await setQueueStatus(b, "cancelled");
-      await setQueueStatus(a, "queued");
+      await updateQueue(b, { status: "cancelled" });
+      await updateQueue(a, { status: "queued" });
+      await logEvent("claim_pair_onchain_miss", { who: "b", a, b });
       return;
     }
 
-    // 1) 先上链：只有失败才 rollback
+    // 1) 上链 lockMatch
     let receipt;
     try {
       const tx = await contract.lockMatch(a, b);
       console.log("[match] lockMatch tx:", tx.hash);
+      await logEvent("lockMatch_tx", { a, b, txHash: tx.hash });
+
       receipt = await tx.wait();
     } catch (e) {
       console.error("[match] lockMatch failed:", e?.shortMessage || e?.message || e);
+      // 上链失败：回滚 DB，让两人回队列
       await rollbackQueueToQueued(a, b);
-      console.log("[match] rolled back queue -> queued");
+      await logEvent("lockMatch_failed", { a, b, err: e?.shortMessage || e?.message || String(e) });
       return;
     }
 
     const locked = extractMatchLocked(receipt);
     if (!locked) {
-      // 极少数：tx 成功但我们没解析到事件（不太可能），当作写库失败处理，不回滚
-      console.error("[match] tx succeeded but no MatchLocked event parsed; will rely on event scan");
+      console.error("[match] tx ok but no MatchLocked parsed; rely on scan window");
+      await logEvent("lockMatch_no_event", { a, b });
       return;
     }
 
-    console.log("[match] matchId =", locked.matchId);
+    console.log("[match] locked matchId:", locked.matchId);
 
-    // 2) 上链成功后：写库失败也绝对不 rollback，只能依赖 B 补写
+    // 2) 写 matches（上链成功后写库失败也不要回滚）
     try {
-      await upsertMatchFromChain(locked.matchId, locked.a, locked.b, "locked");
-      await markMatched(locked.a, locked.b);
-      console.log("[match] ✅ wrote matches + marked matched");
+      await upsertMatch(locked.matchId, locked.a, locked.b, "locking");
+      await markQueueMatched(locked.a, locked.b);
+      await logEvent("match_locked", { matchId: locked.matchId, a: locked.a, b: locked.b }, null, locked.matchId);
+      console.log("[match] ✅ wrote match + marked queue matched");
     } catch (dbErr) {
-      console.error("[match] DB write failed AFTER lockMatch (no rollback):", dbErr?.message || dbErr);
+      console.error("[match] DB write failed AFTER lockMatch:", dbErr?.message || dbErr);
+      await logEvent("db_write_failed_after_lock", { matchId: locked.matchId, err: dbErr?.message || String(dbErr) });
     }
   } catch (e) {
     console.error("[match] tick error:", e?.message || e);
@@ -237,51 +285,30 @@ async function tickMatch() {
   }
 }
 
-// ===== SYNC LOOP (B): 1) 扫 MatchLocked 事件补写 matches & queue 2) 同步 matches 状态 3) 纠偏 queue 状态 =====
+// ---------------------------
+// SYNC LOOP
+// 1) scan recent MatchLocked logs to backfill
+// 2) sync match statuses from chain
+// 3) fix queue inconsistencies + confirm pending statuses
+// ---------------------------
+
 let syncBusy = false;
 
-async function scanMatchLockedEvents() {
+async function scanRecentMatchLockedEvents() {
   const latest = await provider.getBlockNumber();
-
-  let last = await getLastBlock();
-
-  const STEP = Number(process.env.EVENT_SCAN_STEP || 40000);
-  const PRUNED_WINDOW = Number(process.env.PRUNED_WINDOW || 40000);
-
-  // 首次启动：不要扫很老，直接从最近窗口开始
-  if (!last || last <= 0) {
-    last = Math.max(0, latest - PRUNED_WINDOW);
-    await setLastBlock(last);
-  }
-
-  let from = last + 1;
-  if (from > latest) return;
-
+  const fromBase = Math.max(0, latest - PRUNED_WINDOW);
   const filter = contract.filters.MatchLocked();
 
-  while (from <= latest) {
-    const to = Math.min(latest, from + STEP);
+  for (let from = fromBase; from <= latest; from += EVENT_SCAN_STEP + 1) {
+    const to = Math.min(latest, from + EVENT_SCAN_STEP);
 
     let logs = [];
     try {
       logs = await contract.queryFilter(filter, from, to);
     } catch (e) {
       const msg = (e?.shortMessage || e?.message || "").toLowerCase();
-
-      // pruned 节点：老区块查不到 logs，直接跳到最近窗口
-      if (msg.includes("pruned")) {
-        const newLast = Math.max(0, latest - PRUNED_WINDOW);
-        console.error("[sync] pruned logs; jump last_block to", newLast);
-        await setLastBlock(newLast);
-        return;
-      }
-
-      console.error("[sync] getLogs failed range", from, to, e?.message || e);
+      console.error("[sync] getLogs failed range", from, to, msg);
       return;
-    }
-
-    if (logs.length > 0) {
-      console.log("[sync] MatchLocked logs:", logs.length, "range:", from, "-", to);
     }
 
     for (const ev of logs) {
@@ -290,15 +317,12 @@ async function scanMatchLockedEvents() {
       const b = lc(ev.args.b);
 
       try {
-        await upsertMatchFromChain(matchId, a, b, "locked");
-        await markMatched(a, b);
+        await upsertMatch(matchId, a, b, "locking");
+        await markQueueMatched(a, b);
       } catch (err) {
-        console.error("[sync] event upsert failed:", matchId, err?.message || err);
+        console.error("[sync] backfill failed:", matchId, err?.message || err);
       }
     }
-
-    await setLastBlock(to);
-    from = to + 1;
   }
 }
 
@@ -307,7 +331,7 @@ async function syncMatchStatuses() {
     .from("matches")
     .select("chain_match_id,status")
     .eq("contract_address", CONTRACT_ADDRESS)
-    .in("status", ["locked", "disputed"])
+    .in("status", ["locking", "disputed"]) // 你现在主要关心这俩
     .order("created_at", { ascending: true })
     .limit(SYNC_BATCH);
 
@@ -316,34 +340,48 @@ async function syncMatchStatuses() {
 
   for (const row of data) {
     const mid = Number(row.chain_match_id);
-    const res = await contract.getMatch(mid);
-    const st = Number(res[2]); // 1 locked,2 disputed,3 settled,4 cancelled
+    let res;
+    try {
+      res = await contract.getMatch(mid);
+    } catch (e) {
+      console.error("[sync] getMatch rpc fail mid", mid, e?.message || e);
+      continue;
+    }
 
-    if (st === 2 && row.status !== "disputed") {
-      console.log("[sync] match", mid, "-> disputed");
-      await updateMatchStatus(mid, "disputed");
-    } else if (st === 3 && row.status !== "settled") {
-      console.log("[sync] match", mid, "-> settled");
-      await updateMatchStatus(mid, "settled");
-    } else if (st === 4 && row.status !== "cancelled") {
-      console.log("[sync] match", mid, "-> cancelled");
-      await updateMatchStatus(mid, "cancelled");
+    const chainSt = Number(res[2]);
+    const want = mapChainStatusToText(chainSt);
+
+    if (want !== row.status) {
+      console.log("[sync] match", mid, row.status, "->", want);
+      const winner = lc(res[9]); // winner address (per your ABI)
+      const disputedBy = lc(res[7]);
+
+      const patch = { status: want };
+      if (want === "resolved" && winner && winner !== ethers.ZeroAddress) patch.winner = winner;
+      if (want === "disputed" && disputedBy && disputedBy !== ethers.ZeroAddress) patch.dispute_by = disputedBy;
+
+      await updateMatch(mid, patch);
+      await logEvent("match_status_sync", { mid, from: row.status, to: want }, null, mid);
     }
   }
 }
 
 const lastCheck = new Map(); // wallet -> count
 
-async function fixQueueInconsistency() {
-  const { data } = await supabase
+async function fixQueueAndPending() {
+  // 处理：pending_enqueue / pending_leave / matched / cancelled / queued 的纠偏
+  const { data, error } = await supabase
     .from("queue")
     .select("wallet,status")
-    .in("status", ["matched","locking","cancelled"]);
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .in("status", ["pending_enqueue", "pending_leave", "matched", "cancelled", "queued"])
+    .limit(SYNC_BATCH);
 
-  if (!data) return;
+  if (error) throw error;
+  if (!data || data.length === 0) return;
 
   for (const row of data) {
-    const w = row.wallet.toLowerCase();
+    const w = lc(row.wallet);
 
     let im, iq;
     try {
@@ -352,41 +390,48 @@ async function fixQueueInconsistency() {
         contract.inQueue(w)
       ]);
     } catch (e) {
-      console.log("[sync] rpc fail skip", w);
-      continue; // RPC 失败直接跳过
+      continue;
     }
 
-    if (!im && !iq) {
+    // 规则：
+    // - 链上 inMatch => matched
+    // - 链上 inQueue => queued
+    // - 都不是 => cancelled
+    const want = im ? "matched" : (iq ? "queued" : "cancelled");
+
+    // pending 状态：如果链上已经体现了，就落到最终状态
+    if (row.status === "pending_enqueue" || row.status === "pending_leave") {
+      if (row.status !== want) {
+        await updateQueue(w, { status: want });
+        await logEvent("queue_pending_resolved", { wallet: w, from: row.status, to: want }, w);
+      }
+      continue;
+    }
+
+    // 非 pending：做“二次确认”避免偶发 RPC 抖动
+    if (row.status !== want) {
       const c = (lastCheck.get(w) || 0) + 1;
       lastCheck.set(w, c);
 
-      if (c < 2) {
-        console.log("[sync] wait confirm", w);
-        continue;
-      }
+      if (c < 2) continue; // 连续两次不一致才改
+      lastCheck.delete(w);
 
-      console.log("[sync] confirmed cancelled", w);
-      await setQueueStatus(w, "cancelled");
+      await updateQueue(w, { status: want });
+      await logEvent("queue_fixed", { wallet: w, from: row.status, to: want }, w);
     } else {
       lastCheck.delete(w);
-      const want = im ? "matched" : "queued";
-      if (row.status !== want) {
-        console.log("[sync] fix", w, row.status, "->", want);
-        await setQueueStatus(w, want);
-      }
     }
   }
 }
-
 
 async function tickSync() {
   if (syncBusy) return;
   syncBusy = true;
 
   try {
-    await scanMatchLockedEvents(); // B-1: 补写 matches/queue
-    await syncMatchStatuses();     // B-2: 同步 disputed/settled/cancelled
-    await fixQueueInconsistency(); // B-3: 纠偏 queue
+    await scanRecentMatchLockedEvents();
+    await syncMatchStatuses();
+    await fixQueueAndPending();
   } catch (e) {
     console.error("[sync] tick error:", e?.message || e);
   } finally {
@@ -394,19 +439,135 @@ async function tickSync() {
   }
 }
 
-// ===== dummy http server for Render =====
-const PORT = process.env.PORT || 10000;
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("matchmaker running\n");
-}).listen(PORT, () => {
-  console.log("HTTP server listening on", PORT);
-});
+// ---------------------------
+// Simple HTTP API for frontend
+// - POST /api/queue/enqueue { wallet, txHash }
+// - POST /api/queue/leave   { wallet, txHash }
+// - GET  /api/state?wallet=0x...
+// ---------------------------
 
-// ===== boot =====
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+async function readJson(req) {
+  return await new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      if (!body) return resolve({});
+      try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+    });
+  });
+}
+
+async function handle(req, res) {
+  setCors(res);
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  const u = new URL(req.url, "http://localhost");
+  const path = u.pathname;
+
+  try {
+    if (req.method === "GET" && (path === "/" || path === "/health")) {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end("matchmaker running\n");
+    }
+
+    if (req.method === "POST" && path === "/api/queue/enqueue") {
+      const { wallet: w, txHash } = await readJson(req);
+      if (!w || !txHash) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
+      }
+
+      await upsertQueue(w, {
+        status: "pending_enqueue",
+        enqueue_tx: txHash
+      });
+      await logEvent("api_enqueue", { txHash }, w);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    if (req.method === "POST" && path === "/api/queue/leave") {
+      const { wallet: w, txHash } = await readJson(req);
+      if (!w || !txHash) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
+      }
+
+      // leave 也走 pending，最终由 sync 纠偏到 cancelled/queued/matched
+      await upsertQueue(w, {
+        status: "pending_leave",
+        leave_tx: txHash
+      });
+      await logEvent("api_leave", { txHash }, w);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    if (req.method === "GET" && path === "/api/state") {
+      const w = lc(u.searchParams.get("wallet") || "");
+      if (!w) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+      }
+
+      const { data: q, error: qErr } = await supabase
+        .from("queue")
+        .select("status,enqueue_tx,leave_tx,updated_at")
+        .eq("contract_address", CONTRACT_ADDRESS)
+        .eq("wallet", w)
+        .maybeSingle();
+
+      if (qErr) throw qErr;
+
+      // 找这个人相关的一场“未 resolved”的对局（如果有）
+      const { data: ms, error: mErr } = await supabase
+        .from("matches")
+        .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at")
+        .eq("contract_address", CONTRACT_ADDRESS)
+        .or(`player_a.eq.${w},player_b.eq.${w}`)
+        .neq("status", "resolved")
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (mErr) throw mErr;
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, queue: q || null, match: (ms && ms[0]) || null }));
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "not found" }));
+  } catch (e) {
+    console.error("[http] error:", e?.message || e);
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+  }
+}
+
+// ---------------------------
+// Boot
+// ---------------------------
+
+const PORT = process.env.PORT || 10000;
+
 console.log("Starting service...");
 console.log("CONTRACT_ADDRESS:", CONTRACT_ADDRESS);
 console.log("MATCH_INTERVAL_MS:", MATCH_INTERVAL_MS, "SYNC_INTERVAL_MS:", SYNC_INTERVAL_MS);
+
+http.createServer(handle).listen(PORT, () => {
+  console.log("HTTP server listening on", PORT);
+});
 
 setInterval(tickMatch, MATCH_INTERVAL_MS);
 setInterval(tickSync, SYNC_INTERVAL_MS);
