@@ -1,8 +1,7 @@
 // service.js (drop-in replacement)
-// - Works with ONLY 3 tables: queue, matches, events
-// - No RPC required, no chain_sync_state required
-// - Provides simple HTTP APIs for frontend write requests
-// - Runs matchmaker loop + chain sync loop
+// - Works with ONLY 3 tables: queue, matches, events (+ player_profiles you already use)
+// - Match success -> auto create xl room -> save room_id + sides
+// - Provides /api/room/join to return tencentmsdk deep link (auto blue/red)
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
@@ -30,6 +29,10 @@ const SYNC_BATCH = Number(process.env.SYNC_BATCH || 50);
 const EVENT_SCAN_STEP = Number(process.env.EVENT_SCAN_STEP || 20000);
 const PRUNED_WINDOW = Number(process.env.PRUNED_WINDOW || 60000); // 最近多少块
 
+// XL room endpoints
+const ROOM_CREATE_URL = process.env.ROOM_CREATE_URL;
+const ROOM_PAGE_PREFIX = process.env.ROOM_PAGE_PREFIX;
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const ABI = [
@@ -50,8 +53,6 @@ const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 function lc(addr) { return (addr || "").toLowerCase(); }
 function nowIso() { return new Date().toISOString(); }
 
-async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 async function logEvent(type, payload = {}, walletAddr = null, matchId = null) {
   try {
     await supabase.from("events").insert({
@@ -65,9 +66,115 @@ async function logEvent(type, payload = {}, walletAddr = null, matchId = null) {
 }
 
 // ---------------------------
-// DB helpers (new schema)
-// queue: wallet, contract_address, status, enqueue_tx, leave_tx, created_at, updated_at
-// matches: contract_address, chain_match_id, player_a, player_b, status, winner, dispute_by, created_at, updated_at
+// XL room helpers
+// ---------------------------
+
+function buildRoomCs({ uid }) {
+  return JSON.stringify({
+    type: "zsf",
+    mapID: 20001,
+    mapType: 1,
+    uid: String(uid),
+    platType: "2",
+    banhero: [],
+    cs: []
+  });
+}
+
+async function createXlRoom({ matchId }) {
+  // 用 matchId 派生一个确定性的 uid（不依赖随机）
+  const uid = 100000000000000000n + BigInt(matchId);
+  const cs = buildRoomCs({ uid });
+
+  const form = new URLSearchParams();
+  form.set("cs", cs);
+  form.set("roomName", "未命名房间");
+
+  const resp = await fetch(ROOM_CREATE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+    body: form.toString()
+  });
+
+  const text = (await resp.text()).trim();
+  if (!resp.ok) throw new Error(`create room failed HTTP ${resp.status}: ${text}`);
+  if (!/^\d{3,10}$/.test(text)) throw new Error(`unexpected roomId response: "${text}"`);
+
+  return text; // roomId
+}
+
+function buildTencentLaunchLink({ roomId, side }) {
+  // side: "blue" | "red"
+  const campid = side === "blue" ? "1" : "2";
+
+  const payload = {
+    createType: "2",
+    mapID: 20001,
+    ullRoomid: Number(roomId),
+    mapType: 1,
+    ullExternUid: Number(roomId),
+    roomName: "0",
+    teamerNum: "9",
+    platType: "2",
+    campid,
+    firstCountDownTime: "666666666",
+    secondCountDownTime: "17",
+    AddType: "0",
+    OfflineRelayEntityID: "",
+    openAICommentator: "0",
+    banHerosCamp1: [],
+    banHerosCamp2: [],
+    customDefineItems: []
+  };
+
+  const base64 = Buffer.from(JSON.stringify(payload)).toString("base64");
+  return `tencentmsdk1104466820://?gamedata=SmobaLaunch_${base64}`;
+}
+
+// 只在 matches.room_id 为空时创建并写入，避免重复覆盖
+async function ensureRoomForMatch({ matchId, a, b }) {
+  // 先查一下是否已经有 room
+  const { data: existing, error: qerr } = await supabase
+    .from("matches")
+    .select("room_id")
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("chain_match_id", Number(matchId))
+    .maybeSingle();
+
+  if (qerr) throw qerr;
+  if (existing?.room_id) return existing.room_id;
+
+  const roomId = await createXlRoom({ matchId });
+
+  // 固定分配：player_a=蓝，player_b=红（确定性，不会乱）
+  // 只在 room_id is null 时写入，避免多实例覆盖
+  const { data: upd, error: uerr } = await supabase
+    .from("matches")
+    .update({
+      room_id: roomId,
+      room_created_at: nowIso(),
+      side_a: "blue",
+      side_b: "red",
+      updated_at: nowIso()
+    })
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("chain_match_id", Number(matchId))
+    .is("room_id", null)
+    .select("room_id");
+
+  if (uerr) throw uerr;
+
+  // 如果 update 没更新到行，说明别的实例已经写了 room_id（我们创建了额外房间也无所谓，不影响主流程）
+  const finalRoomId = upd?.[0]?.room_id || roomId;
+
+  await logEvent("room_created", { matchId, roomId: finalRoomId, a, b }, null, matchId);
+  console.log("[room] ensured roomId", finalRoomId, "for match", matchId);
+
+  return finalRoomId;
+}
+
+// ---------------------------
+// DB helpers
 // ---------------------------
 
 async function upsertQueue(walletAddr, patch) {
@@ -101,7 +208,7 @@ async function markQueueMatched(a, b) {
     .update({ status: "matched", updated_at: nowIso() })
     .eq("contract_address", CONTRACT_ADDRESS)
     .in("wallet", [lc(a), lc(b)])
-    .in("status", ["queued", "pending_enqueue"]); // 保险：避免误伤 cancelled/pending_leave
+    .in("status", ["queued", "pending_enqueue"]);
 
   if (error) throw error;
 }
@@ -112,7 +219,7 @@ async function rollbackQueueToQueued(a, b) {
     .update({ status: "queued", updated_at: nowIso() })
     .eq("contract_address", CONTRACT_ADDRESS)
     .in("wallet", [lc(a), lc(b)])
-    .in("status", ["matched"]); // 只回滚我们刚刚 claim 的
+    .in("status", ["matched"]);
 
   if (error) throw error;
 }
@@ -147,7 +254,6 @@ async function updateMatch(matchId, patch) {
 
 // “在 DB 里选 2 个 queued，尽量原子 claim（单实例够用）”
 async function claimTwoPlayers() {
-  // 取最早的 2 个 queued
   const { data: rows, error } = await supabase
     .from("queue")
     .select("wallet,status,created_at")
@@ -162,7 +268,6 @@ async function claimTwoPlayers() {
   const a = lc(rows[0].wallet);
   const b = lc(rows[1].wallet);
 
-  // 把这两个人标为 matched，避免下一个 tick 又拿到（这里用 status=queued 限制）
   const { data: upd, error: uerr } = await supabase
     .from("queue")
     .update({ status: "matched", updated_at: nowIso() })
@@ -172,8 +277,6 @@ async function claimTwoPlayers() {
     .select("wallet");
 
   if (uerr) throw uerr;
-
-  // 如果更新不到 2 行，说明被别的流程抢了（或状态变了）
   if (!upd || upd.length < 2) return null;
 
   return { a, b };
@@ -200,12 +303,10 @@ function extractMatchLocked(receipt) {
 }
 
 function mapChainStatusToText(st) {
-  // 你合约注释：1 locked,2 disputed,3 settled,4 cancelled
-  // 我们表里是 locking/playing/disputed/resolved
   if (st === 1) return "locking";
   if (st === 2) return "disputed";
   if (st === 3) return "resolved";
-  if (st === 4) return "resolved"; // 取消也归到 resolved（你也可以以后加 cancelled 状态）
+  if (st === 4) return "resolved";
   return "locking";
 }
 
@@ -228,7 +329,6 @@ async function tickMatch() {
     console.log("[match] claimed pair:", a, b);
     await logEvent("claim_pair", { a, b });
 
-    // 可选链上校验：DB queued 但链上不在队列，直接纠偏
     const [aq, bq] = await Promise.all([contract.inQueue(a), contract.inQueue(b)]);
     if (!aq) {
       await updateQueue(a, { status: "cancelled" });
@@ -249,11 +349,9 @@ async function tickMatch() {
       const tx = await contract.lockMatch(a, b);
       console.log("[match] lockMatch tx:", tx.hash);
       await logEvent("lockMatch_tx", { a, b, txHash: tx.hash });
-
       receipt = await tx.wait();
     } catch (e) {
       console.error("[match] lockMatch failed:", e?.shortMessage || e?.message || e);
-      // 上链失败：回滚 DB，让两人回队列
       await rollbackQueueToQueued(a, b);
       await logEvent("lockMatch_failed", { a, b, err: e?.shortMessage || e?.message || String(e) });
       return;
@@ -268,12 +366,20 @@ async function tickMatch() {
 
     console.log("[match] locked matchId:", locked.matchId);
 
-    // 2) 写 matches（上链成功后写库失败也不要回滚）
+    // 2) 写 matches + queue
     try {
       await upsertMatch(locked.matchId, locked.a, locked.b, "locking");
       await markQueueMatched(locked.a, locked.b);
       await logEvent("match_locked", { matchId: locked.matchId, a: locked.a, b: locked.b }, null, locked.matchId);
       console.log("[match] ✅ wrote match + marked queue matched");
+
+      // ✅ NEW: 自动创建房间并写入 matches（失败不影响主流程）
+      try {
+        await ensureRoomForMatch({ matchId: locked.matchId, a: locked.a, b: locked.b });
+      } catch (e) {
+        console.error("[room] ensure room failed:", e?.message || e);
+        await logEvent("room_ensure_failed", { matchId: locked.matchId, err: e?.message || String(e) }, null, locked.matchId);
+      }
     } catch (dbErr) {
       console.error("[match] DB write failed AFTER lockMatch:", dbErr?.message || dbErr);
       await logEvent("db_write_failed_after_lock", { matchId: locked.matchId, err: dbErr?.message || String(dbErr) });
@@ -287,9 +393,6 @@ async function tickMatch() {
 
 // ---------------------------
 // SYNC LOOP
-// 1) scan recent MatchLocked logs to backfill
-// 2) sync match statuses from chain
-// 3) fix queue inconsistencies + confirm pending statuses
 // ---------------------------
 
 let syncBusy = false;
@@ -319,6 +422,9 @@ async function scanRecentMatchLockedEvents() {
       try {
         await upsertMatch(matchId, a, b, "locking");
         await markQueueMatched(a, b);
+
+        // ✅ NEW: 事件补写时也尝试补齐房间（失败忽略）
+        try { await ensureRoomForMatch({ matchId, a, b }); } catch {}
       } catch (err) {
         console.error("[sync] backfill failed:", matchId, err?.message || err);
       }
@@ -331,7 +437,7 @@ async function syncMatchStatuses() {
     .from("matches")
     .select("chain_match_id,status")
     .eq("contract_address", CONTRACT_ADDRESS)
-    .in("status", ["locking", "disputed"]) // 你现在主要关心这俩
+    .in("status", ["locking", "disputed"])
     .order("created_at", { ascending: true })
     .limit(SYNC_BATCH);
 
@@ -353,7 +459,7 @@ async function syncMatchStatuses() {
 
     if (want !== row.status) {
       console.log("[sync] match", mid, row.status, "->", want);
-      const winner = lc(res[9]); // winner address (per your ABI)
+      const winner = lc(res[9]);
       const disputedBy = lc(res[7]);
 
       const patch = { status: want };
@@ -369,7 +475,6 @@ async function syncMatchStatuses() {
 const lastCheck = new Map(); // wallet -> count
 
 async function fixQueueAndPending() {
-  // 处理：pending_enqueue / pending_leave / matched / cancelled / queued 的纠偏
   const { data, error } = await supabase
     .from("queue")
     .select("wallet,status")
@@ -389,17 +494,12 @@ async function fixQueueAndPending() {
         contract.inMatch(w),
         contract.inQueue(w)
       ]);
-    } catch (e) {
+    } catch {
       continue;
     }
 
-    // 规则：
-    // - 链上 inMatch => matched
-    // - 链上 inQueue => queued
-    // - 都不是 => cancelled
     const want = im ? "matched" : (iq ? "queued" : "cancelled");
 
-    // pending 状态：如果链上已经体现了，就落到最终状态
     if (row.status === "pending_enqueue" || row.status === "pending_leave") {
       if (row.status !== want) {
         await updateQueue(w, { status: want });
@@ -408,12 +508,11 @@ async function fixQueueAndPending() {
       continue;
     }
 
-    // 非 pending：做“二次确认”避免偶发 RPC 抖动
     if (row.status !== want) {
       const c = (lastCheck.get(w) || 0) + 1;
       lastCheck.set(w, c);
 
-      if (c < 2) continue; // 连续两次不一致才改
+      if (c < 2) continue;
       lastCheck.delete(w);
 
       await updateQueue(w, { status: want });
@@ -440,10 +539,7 @@ async function tickSync() {
 }
 
 // ---------------------------
-// Simple HTTP API for frontend
-// - POST /api/queue/enqueue { wallet, txHash }
-// - POST /api/queue/leave   { wallet, txHash }
-// - GET  /api/state?wallet=0x...
+// Simple HTTP API
 // ---------------------------
 
 function setCors(res) {
@@ -478,119 +574,117 @@ async function handle(req, res) {
       res.writeHead(200, { "Content-Type": "text/plain" });
       return res.end("matchmaker running\n");
     }
+
+    // ---- profile apis (your existing code kept) ----
     if (req.method === "POST" && path === "/api/profile/set_once") {
-  const { wallet: w, gameName, message, signature } = await readJson(req);
+      const { wallet: w, gameName, message, signature } = await readJson(req);
 
-  if (!w || !gameName || !message || !signature) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "missing wallet/gameName/message/signature" }));
-  }
+      if (!w || !gameName || !message || !signature) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet/gameName/message/signature" }));
+      }
 
-  const wallet = lc(w);
-  const name = String(gameName).trim();
+      const walletAddr = lc(w);
+      const name = String(gameName).trim();
 
-  if (name.length < 1 || name.length > 30) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "gameName length must be 1~30" }));
-  }
+      if (name.length < 1 || name.length > 30) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "gameName length must be 1~30" }));
+      }
 
-  // message 格式固定，防复用
-  const lines = String(message).split("\n").map(s => s.trim()).filter(Boolean);
-  if (lines[0] !== "WZRY_SET_NAME_ONCE") {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "bad message header" }));
-  }
-  const kv = {};
-  for (const line of lines.slice(1)) {
-    const idx = line.indexOf(":");
-    if (idx > 0) kv[line.slice(0, idx).toLowerCase()] = line.slice(idx + 1);
-  }
+      const lines = String(message).split("\n").map(s => s.trim()).filter(Boolean);
+      if (lines[0] !== "WZRY_SET_NAME_ONCE") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "bad message header" }));
+      }
+      const kv = {};
+      for (const line of lines.slice(1)) {
+        const idx = line.indexOf(":");
+        if (idx > 0) kv[line.slice(0, idx).toLowerCase()] = line.slice(idx + 1);
+      }
 
-  const msgWallet = lc(kv.wallet || "");
-  const msgName = String(kv.name || "").trim();
-  const ts = Number(kv.ts || 0);
-  const origin = String(kv.origin || "");
-  const msgContract = lc(kv.contract || "");
+      const msgWallet = lc(kv.wallet || "");
+      const msgName = String(kv.name || "").trim();
+      const ts = Number(kv.ts || 0);
+      const origin = String(kv.origin || "");
+      const msgContract = lc(kv.contract || "");
 
-  if (msgWallet !== wallet || msgName !== name || msgContract !== CONTRACT_ADDRESS || !ts || !origin) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "message mismatch" }));
-  }
+      if (msgWallet !== walletAddr || msgName !== name || msgContract !== CONTRACT_ADDRESS || !ts || !origin) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "message mismatch" }));
+      }
 
-  // 时间窗：5分钟
-  const now = Date.now();
-  if (Math.abs(now - ts) > 5 * 60 * 1000) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "signature expired" }));
-  }
+      const now = Date.now();
+      if (Math.abs(now - ts) > 5 * 60 * 1000) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "signature expired" }));
+      }
 
-  // 验签
-  let recovered;
-  try {
-    recovered = ethers.verifyMessage(message, signature);
-  } catch {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "bad signature" }));
-  }
-  if (lc(recovered) !== wallet) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "signature not from wallet" }));
-  }
+      let recovered;
+      try {
+        recovered = ethers.verifyMessage(message, signature);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "bad signature" }));
+      }
+      if (lc(recovered) !== walletAddr) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "signature not from wallet" }));
+      }
 
-  // 已存在则不可更改
-  const { data: exist, error: e1 } = await supabase
-    .from("player_profiles")
-    .select("wallet,game_name")
-    .eq("wallet", wallet)
-    .maybeSingle();
+      const { data: exist, error: e1 } = await supabase
+        .from("player_profiles")
+        .select("wallet,game_name")
+        .eq("wallet", walletAddr)
+        .maybeSingle();
 
-  if (e1) {
-    res.writeHead(500, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: e1.message }));
-  }
-  if (exist) {
-    res.writeHead(409, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "name already set and cannot be changed" }));
-  }
+      if (e1) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: e1.message }));
+      }
+      if (exist) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "name already set and cannot be changed" }));
+      }
 
-  // 只 insert（我们表的 RLS 也只允许 insert）
-  const { error: insErr } = await supabase
-    .from("player_profiles")
-    .insert({ wallet, game_name: name });
+      const { error: insErr } = await supabase
+        .from("player_profiles")
+        .insert({ wallet: walletAddr, game_name: name });
 
-  if (insErr) {
-    res.writeHead(500, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: insErr.message }));
-  }
+      if (insErr) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: insErr.message }));
+      }
 
-  await logEvent("set_name_once", { name, origin, ts }, wallet);
+      await logEvent("set_name_once", { name, origin, ts }, walletAddr);
 
-  res.writeHead(200, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({ ok: true, gameName: name }));
-}
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, gameName: name }));
+    }
 
-if (req.method === "GET" && path === "/api/profile/get") {
-  const w = lc(u.searchParams.get("wallet") || "");
-  if (!w) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
-  }
+    if (req.method === "GET" && path === "/api/profile/get") {
+      const w = lc(u.searchParams.get("wallet") || "");
+      if (!w) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+      }
 
-  const { data, error } = await supabase
-    .from("player_profiles")
-    .select("wallet,game_name,created_at")
-    .eq("wallet", w)
-    .maybeSingle();
+      const { data, error } = await supabase
+        .from("player_profiles")
+        .select("wallet,game_name,created_at")
+        .eq("wallet", w)
+        .maybeSingle();
 
-  if (error) {
-    res.writeHead(500, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: error.message }));
-  }
+      if (error) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: error.message }));
+      }
 
-  res.writeHead(200, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({ ok: true, profile: data || null }));
-}
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, profile: data || null }));
+    }
 
+    // ---- queue apis ----
     if (req.method === "POST" && path === "/api/queue/enqueue") {
       const { wallet: w, txHash } = await readJson(req);
       if (!w || !txHash) {
@@ -598,10 +692,7 @@ if (req.method === "GET" && path === "/api/profile/get") {
         return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
       }
 
-      await upsertQueue(w, {
-        status: "pending_enqueue",
-        enqueue_tx: txHash
-      });
+      await upsertQueue(w, { status: "pending_enqueue", enqueue_tx: txHash });
       await logEvent("api_enqueue", { txHash }, w);
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -615,17 +706,72 @@ if (req.method === "GET" && path === "/api/profile/get") {
         return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
       }
 
-      // leave 也走 pending，最终由 sync 纠偏到 cancelled/queued/matched
-      await upsertQueue(w, {
-        status: "pending_leave",
-        leave_tx: txHash
-      });
+      await upsertQueue(w, { status: "pending_leave", leave_tx: txHash });
       await logEvent("api_leave", { txHash }, w);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true }));
     }
 
+    // ---- NEW: room join (returns tencentmsdk deep link + roomUrl) ----
+    if (req.method === "GET" && path === "/api/room/join") {
+      const w = lc(u.searchParams.get("wallet") || "");
+      if (!w) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+      }
+
+      const { data: ms, error: mErr } = await supabase
+        .from("matches")
+        .select("chain_match_id,player_a,player_b,status,room_id,side_a,side_b")
+        .eq("contract_address", CONTRACT_ADDRESS)
+        .or(`player_a.eq.${w},player_b.eq.${w}`)
+        .neq("status", "resolved")
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (mErr) throw mErr;
+      const m = ms?.[0];
+      if (!m) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "no active match" }));
+      }
+
+      // 若 room 还没写入，尝试补齐一次（有时 match 已锁定但 ensureRoom 还没跑到）
+      let roomId = m.room_id;
+      if (!roomId) {
+        try {
+          roomId = await ensureRoomForMatch({
+            matchId: Number(m.chain_match_id),
+            a: m.player_a,
+            b: m.player_b
+          });
+        } catch {}
+      }
+
+      if (!roomId) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "room not ready yet" }));
+      }
+
+      const isA = lc(m.player_a) === w;
+      const side = isA ? (m.side_a || "blue") : (m.side_b || "red");
+
+      const roomUrl = `${ROOM_PAGE_PREFIX}${encodeURIComponent(roomId)}`;
+      const launchUrl = buildTencentLaunchLink({ roomId, side });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        ok: true,
+        matchId: Number(m.chain_match_id),
+        roomId,
+        side,
+        roomUrl,
+        launchUrl
+      }));
+    }
+
+    // ---- state ----
     if (req.method === "GET" && path === "/api/state") {
       const w = lc(u.searchParams.get("wallet") || "");
       if (!w) {
@@ -639,34 +785,27 @@ if (req.method === "GET" && path === "/api/profile/get") {
         .eq("contract_address", CONTRACT_ADDRESS)
         .eq("wallet", w)
         .maybeSingle();
-
       if (qErr) throw qErr;
 
-      // 找这个人相关的一场“未 resolved”的对局（如果有）
       const { data: ms, error: mErr } = await supabase
         .from("matches")
-        .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at")
+        .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at,room_id,side_a,side_b")
         .eq("contract_address", CONTRACT_ADDRESS)
         .or(`player_a.eq.${w},player_b.eq.${w}`)
         .neq("status", "resolved")
         .order("created_at", { ascending: false })
         .limit(1);
-
       if (mErr) throw mErr;
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      // ---- NEW: my profile ----
       const { data: meProf, error: meErr } = await supabase
         .from("player_profiles")
         .select("wallet,game_name")
         .eq("wallet", w)
         .maybeSingle();
-
       if (meErr) throw meErr;
-      // ---- NEW: opponent profile (if match exists) ----
-      let oppProf = null;
 
-      const m = (ms && ms[0]) ? ms[0] : null; // 你 matches 查询一般存在 ms 变量
+      let oppProf = null;
+      const m = (ms && ms[0]) ? ms[0] : null;
       if (m) {
         const a = lc(m.player_a);
         const b = lc(m.player_b);
@@ -677,12 +816,11 @@ if (req.method === "GET" && path === "/api/profile/get") {
           .select("wallet,game_name")
           .eq("wallet", oppWallet)
           .maybeSingle();
-
         if (oErr) throw oErr;
         oppProf = o || null;
       }
 
-
+      res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         ok: true,
         queue: q || null,
@@ -690,7 +828,6 @@ if (req.method === "GET" && path === "/api/profile/get") {
         meProfile: meProf || null,
         opponentProfile: oppProf
       }));
-
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -711,6 +848,8 @@ const PORT = process.env.PORT || 10000;
 console.log("Starting service...");
 console.log("CONTRACT_ADDRESS:", CONTRACT_ADDRESS);
 console.log("MATCH_INTERVAL_MS:", MATCH_INTERVAL_MS, "SYNC_INTERVAL_MS:", SYNC_INTERVAL_MS);
+console.log("ROOM_CREATE_URL:", ROOM_CREATE_URL);
+console.log("ROOM_PAGE_PREFIX:", ROOM_PAGE_PREFIX);
 
 http.createServer(handle).listen(PORT, () => {
   console.log("HTTP server listening on", PORT);
