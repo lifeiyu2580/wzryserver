@@ -713,6 +713,50 @@ async function handle(req, res) {
       return res.end(JSON.stringify({ ok: true }));
     }
 
+
+    // ---- DEBUG: create a room and return roomId ----
+if (req.method === "GET" && path === "/api/room/create_test") {
+  try {
+    const uid = String(Date.now()); // 随便用一个 uid，测试用
+    const cs = JSON.stringify({
+      type: "zsf",
+      mapID: 20001,
+      mapType: 1,
+      uid,
+      platType: "2",
+      banhero: [],
+      cs: []
+    });
+
+    const form = new URLSearchParams();
+    form.set("cs", cs);
+    form.set("roomName", "未命名房间");
+
+    // Node 18+ 才有 fetch。若你 Node 太旧，这里会报 fetch is not defined
+    const resp = await fetch("https://xl.xlskw.cn/set.php", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+      body: form.toString()
+    });
+
+    const text = (await resp.text()).trim();
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      httpStatus: resp.status,
+      uid,
+      raw: text
+    }));
+  } catch (e) {
+    console.error("[room] create_test failed:", e?.message || e);
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+  }
+}
+
+
+
     // ---- NEW: room join (returns tencentmsdk deep link + roomUrl) ----
     if (req.method === "GET" && path === "/api/room/join") {
       const w = lc(u.searchParams.get("wallet") || "");
@@ -746,7 +790,9 @@ async function handle(req, res) {
             a: m.player_a,
             b: m.player_b
           });
-        } catch {}
+        } catch (e) {
+          console.error("[room] ensureRoomForMatch failed:", e?.message || e);
+        }
       }
 
       if (!roomId) {
