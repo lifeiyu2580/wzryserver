@@ -713,109 +713,80 @@ async function handle(req, res) {
       return res.end(JSON.stringify({ ok: true }));
     }
 
-
-    // ---- DEBUG: create a room and return roomId ----
-if (req.method === "GET" && path === "/api/room/create_test") {
-  try {
-    const uid = String(Date.now()); // 随便用一个 uid，测试用
-    const cs = JSON.stringify({
-      type: "zsf",
-      mapID: 20001,
-      mapType: 1,
-      uid,
-      platType: "2",
-      banhero: [],
-      cs: []
-    });
-
-    const form = new URLSearchParams();
-    form.set("cs", cs);
-    form.set("roomName", "未命名房间");
-
-    // Node 18+ 才有 fetch。若你 Node 太旧，这里会报 fetch is not defined
-    const resp = await fetch("https://xl.xlskw.cn/set.php", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-      body: form.toString()
-    });
-
-    const text = (await resp.text()).trim();
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      ok: true,
-      httpStatus: resp.status,
-      uid,
-      raw: text
-    }));
-  } catch (e) {
-    console.error("[room] create_test failed:", e?.message || e);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: e?.message || String(e) }));
+    if (req.method === "GET" && path === "/api/room/launch") {
+  const shortId = String(u.searchParams.get("shortId") || "").trim();
+  const side = String(u.searchParams.get("side") || "blue").trim(); // blue/red
+  if (!shortId) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing shortId" }));
   }
+
+  const wantCampid = side === "red" ? "2" : "1";
+  const roomPageUrl = `https://xl.xlskw.cn/lngame.php?id=${encodeURIComponent(shortId)}`;
+
+  const resp = await fetch(roomPageUrl, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Referer": "https://xl.xlskw.cn/"
+    }
+  });
+
+  const html = await resp.text();
+
+  // 1) 先直接找 tencentmsdk 明文
+  const re = /tencentmsdk1104466820:\/\/\?gamedata=SmobaLaunch_[A-Za-z0-9+/=._%-]+/g;
+  const urls = html.match(re) || [];
+
+  function decodeLaunch(url) {
+    try {
+      const gamedata = decodeURIComponent(url.split("gamedata=")[1] || "");
+      const b64 = gamedata.replace(/^SmobaLaunch_/, "");
+      const json = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+      return json;
+    } catch {
+      try {
+        // 有些会是 utf8 需要容错
+        const gamedata = decodeURIComponent(url.split("gamedata=")[1] || "");
+        const b64 = gamedata.replace(/^SmobaLaunch_/, "");
+        const json = JSON.parse(decodeURIComponent(escape(Buffer.from(b64, "base64").toString("binary"))));
+        return json;
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  let launchUrl = null;
+  for (const url of urls) {
+    const j = decodeLaunch(url);
+    if (j && String(j.campid) === wantCampid) {
+      launchUrl = url;
+      break;
+    }
+  }
+  if (!launchUrl && urls.length) launchUrl = urls[0];
+
+  if (!launchUrl) {
+    res.writeHead(502, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: false,
+      error: "cannot extract launch url from room page (maybe JS-generated)",
+      httpStatus: resp.status
+    }));
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    ok: true,
+    shortId,
+    side: (wantCampid === "1" ? "blue" : "red"),
+    roomPageUrl,
+    launchUrl
+  }));
 }
 
-
-
-    // ---- NEW: room join (returns tencentmsdk deep link + roomUrl) ----
-    if (req.method === "GET" && path === "/api/room/join") {
-      const w = lc(u.searchParams.get("wallet") || "");
-      if (!w) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
-      }
-
-      const { data: ms, error: mErr } = await supabase
-        .from("matches")
-        .select("chain_match_id,player_a,player_b,status,room_id,side_a,side_b")
-        .eq("contract_address", CONTRACT_ADDRESS)
-        .or(`player_a.eq.${w},player_b.eq.${w}`)
-        .neq("status", "resolved")
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (mErr) throw mErr;
-      const m = ms?.[0];
-      if (!m) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "no active match" }));
-      }
-
-      // 若 room 还没写入，尝试补齐一次（有时 match 已锁定但 ensureRoom 还没跑到）
-      let roomId = m.room_id;
-      if (!roomId) {
-        try {
-          roomId = await ensureRoomForMatch({
-            matchId: Number(m.chain_match_id),
-            a: m.player_a,
-            b: m.player_b
-          });
-        } catch (e) {
-          console.error("[room] ensureRoomForMatch failed:", e?.message || e);
-        }
-      }
-
-      if (!roomId) {
-        res.writeHead(409, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "room not ready yet" }));
-      }
-
-      const isA = lc(m.player_a) === w;
-      const side = isA ? (m.side_a || "blue") : (m.side_b || "red");
-
-      const roomUrl = `${ROOM_PAGE_PREFIX}${encodeURIComponent(roomId)}`;
-      const launchUrl = buildTencentLaunchLink({ roomId, side });
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({
-        ok: true,
-        matchId: Number(m.chain_match_id),
-        roomId,
-        side,
-        roomUrl,
-        launchUrl
-      }));
-    }
+    
 
     // ---- state ----
     if (req.method === "GET" && path === "/api/state") {
