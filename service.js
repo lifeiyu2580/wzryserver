@@ -103,33 +103,43 @@ async function createXlRoom({ matchId }) {
   return text; // roomId
 }
 
-function buildTencentLaunchLink({ roomId, side }) {
-  // side: "blue" | "red"
-  const campid = side === "blue" ? "1" : "2";
-
-  const payload = {
-    createType: "2",
-    mapID: 20001,
-    ullRoomid: Number(roomId),
-    mapType: 1,
-    ullExternUid: Number(roomId),
-    roomName: "0",
-    teamerNum: "9",
-    platType: "2",
-    campid,
-    firstCountDownTime: "666666666",
-    secondCountDownTime: "17",
-    AddType: "0",
-    OfflineRelayEntityID: "",
-    openAICommentator: "0",
-    banHerosCamp1: [],
-    banHerosCamp2: [],
-    customDefineItems: []
-  };
-
-  const base64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-  return `tencentmsdk1104466820://?gamedata=SmobaLaunch_${base64}`;
+function parseGamedataFromLaunchUrl(launchUrl) {
+  // launchUrl: tencentmsdk1104466820://?gamedata=SmobaLaunch_xxx
+  const idx = launchUrl.indexOf("gamedata=");
+  if (idx < 0) throw new Error("missing gamedata");
+  const gamedata = decodeURIComponent(launchUrl.slice(idx + "gamedata=".length));
+  if (!gamedata.startsWith("SmobaLaunch_")) throw new Error("bad gamedata prefix");
+  const b64 = gamedata.slice("SmobaLaunch_".length);
+  return b64;
 }
+
+function decodePayloadStr(b64) {
+  // 重要：不要 JSON.parse（会丢大整数精度）
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+
+function encodePayloadStr(payloadStr) {
+  return Buffer.from(payloadStr, "utf8").toString("base64");
+}
+
+function setCampid(payloadStr, campid /* "1" or "2" */) {
+  if (!/\"campid\"\s*:\s*\"[12]\"/.test(payloadStr)) {
+    throw new Error("campid field not found in payload");
+  }
+  return payloadStr.replace(/\"campid\"\s*:\s*\"[12]\"/, `"campid":"${campid}"`);
+}
+
+function extractUllRoomid(payloadStr) {
+  const m = payloadStr.match(/\"ullRoomid\"\s*:\s*(\d+)/);
+  return m ? m[1] : null; // 作为字符串
+}
+
+function buildLaunchUrlFromPayloadStr(payloadStr) {
+  const b64 = encodePayloadStr(payloadStr);
+  const gamedata = `SmobaLaunch_${b64}`;
+  return `tencentmsdk1104466820://?gamedata=${encodeURIComponent(gamedata)}`;
+}
+
 
 // 只在 matches.room_id 为空时创建并写入，避免重复覆盖
 async function ensureRoomForMatch({ matchId, a, b }) {
@@ -712,81 +722,84 @@ async function handle(req, res) {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true }));
     }
-
-    if (req.method === "GET" && path === "/api/room/launch") {
-  const shortId = String(u.searchParams.get("shortId") || "").trim();
-  const side = String(u.searchParams.get("side") || "blue").trim(); // blue/red
-  if (!shortId) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "missing shortId" }));
-  }
-
-  const wantCampid = side === "red" ? "2" : "1";
-  const roomPageUrl = `https://xl.xlskw.cn/lngame.php?id=${encodeURIComponent(shortId)}`;
-
-  const resp = await fetch(roomPageUrl, {
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Referer": "https://xl.xlskw.cn/"
-    }
-  });
-
-  const html = await resp.text();
-
-  // 1) 先直接找 tencentmsdk 明文
-  const re = /tencentmsdk1104466820:\/\/\?gamedata=SmobaLaunch_[A-Za-z0-9+/=._%-]+/g;
-  const urls = html.match(re) || [];
-
-  function decodeLaunch(url) {
-    try {
-      const gamedata = decodeURIComponent(url.split("gamedata=")[1] || "");
-      const b64 = gamedata.replace(/^SmobaLaunch_/, "");
-      const json = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
-      return json;
-    } catch {
-      try {
-        // 有些会是 utf8 需要容错
-        const gamedata = decodeURIComponent(url.split("gamedata=")[1] || "");
-        const b64 = gamedata.replace(/^SmobaLaunch_/, "");
-        const json = JSON.parse(decodeURIComponent(escape(Buffer.from(b64, "base64").toString("binary"))));
-        return json;
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  let launchUrl = null;
-  for (const url of urls) {
-    const j = decodeLaunch(url);
-    if (j && String(j.campid) === wantCampid) {
-      launchUrl = url;
-      break;
-    }
-  }
-  if (!launchUrl && urls.length) launchUrl = urls[0];
-
-  if (!launchUrl) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      ok: false,
-      error: "cannot extract launch url from room page (maybe JS-generated)",
-      httpStatus: resp.status
-    }));
-  }
-
-  res.writeHead(200, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({
-    ok: true,
-    shortId,
-    side: (wantCampid === "1" ? "blue" : "red"),
-    roomPageUrl,
-    launchUrl
-  }));
-}
-
     
+    if (req.method === "POST" && path === "/api/roompool/add") {
+      const { launchUrl } = await readJson(req);
+      if (!launchUrl) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing launchUrl" }));
+      }
+
+      const b64 = parseGamedataFromLaunchUrl(String(launchUrl).trim());
+      const payloadStr = decodePayloadStr(b64);
+
+      // 自动补齐两边
+      const payloadBlue = setCampid(payloadStr, "1");
+      const payloadRed  = setCampid(payloadStr, "2");
+
+      const launch_blue = buildLaunchUrlFromPayloadStr(payloadBlue);
+      const launch_red  = buildLaunchUrlFromPayloadStr(payloadRed);
+
+      const ullRoomid = extractUllRoomid(payloadStr);
+
+      const { error } = await supabase.from("room_pool").insert({
+        ull_roomid: ullRoomid,
+        base_payload: payloadStr,
+        launch_blue,
+        launch_red,
+        status: "unused"
+      });
+
+      if (error) throw error;
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, ullRoomid, launch_blue, launch_red }));
+    }
+
+    if (req.method === "GET" && path === "/api/roompool/claim") {
+      const w = lc(u.searchParams.get("wallet") || "");
+      const side = (u.searchParams.get("side") || "blue") === "red" ? "red" : "blue";
+      if (!w) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+      }
+
+      // 1) 取最早的 unused
+      const { data: rows, error: qErr } = await supabase
+        .from("room_pool")
+        .select("id,launch_blue,launch_red,ull_roomid")
+        .eq("status", "unused")
+        .order("created_at", { ascending: true })
+        .limit(1);
+
+      if (qErr) throw qErr;
+      const r = rows?.[0];
+      if (!r) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "no unused room" }));
+      }
+
+      // 2) 标记 used（带 status=unused 条件，避免重复用）
+      const { data: upd, error: uErr } = await supabase
+        .from("room_pool")
+        .update({ status: "used", used_at: nowIso(), used_by_wallet: w })
+        .eq("id", r.id)
+        .eq("status", "unused")
+        .select("id");
+
+      if (uErr) throw uErr;
+      if (!upd || upd.length === 0) {
+        // 被并发抢了
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "race, try again" }));
+      }
+
+      const launchUrl = side === "red" ? r.launch_red : r.launch_blue;
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, ullRoomid: r.ull_roomid, side, launchUrl }));
+    }
+
 
     // ---- state ----
     if (req.method === "GET" && path === "/api/state") {
