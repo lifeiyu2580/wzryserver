@@ -229,10 +229,11 @@ async function rollbackQueueToQueued(a, b) {
     .update({ status: "queued", updated_at: nowIso() })
     .eq("contract_address", CONTRACT_ADDRESS)
     .in("wallet", [lc(a), lc(b)])
-    .in("status", ["matched"]);
+    .in("status", ["matched", "locking"]); // ✅ 放宽一点
 
   if (error) throw error;
 }
+
 
 async function upsertMatch(matchId, a, b, statusText, extra = {}) {
   const payload = {
@@ -362,6 +363,8 @@ async function tickMatch() {
       receipt = await tx.wait();
     } catch (e) {
       console.error("[match] lockMatch failed:", e?.shortMessage || e?.message || e);
+
+      // 回滚：让两人回 queued（确保 rollbackQueueToQueued 支持 matched/locking）
       await rollbackQueueToQueued(a, b);
       await logEvent("lockMatch_failed", { a, b, err: e?.shortMessage || e?.message || String(e) });
       return;
@@ -383,17 +386,39 @@ async function tickMatch() {
       await logEvent("match_locked", { matchId: locked.matchId, a: locked.a, b: locked.b }, null, locked.matchId);
       console.log("[match] ✅ wrote match + marked queue matched");
 
-      // ✅ NEW: 自动创建房间并写入 matches（失败不影响主流程）
+      // 3) 分配房间（失败不影响主流程）
       try {
-        await ensureRoomForMatch({ matchId: locked.matchId, a: locked.a, b: locked.b });
+        const { data: mm, error: mmErr } = await supabase
+          .from("matches")
+          .select("room_pool_id,launch_blue,launch_red")
+          .eq("contract_address", CONTRACT_ADDRESS)
+          .eq("chain_match_id", Number(locked.matchId))
+          .maybeSingle();
+        if (mmErr) throw mmErr;
+
+        const already = mm && (mm.room_pool_id || (mm.launch_blue && mm.launch_red));
+        if (!already) {
+          const room = await claimRoomFromPool(locked.matchId);
+          if (room) {
+            console.log("[room] assigned to match", locked.matchId, "pool:", room.roomPoolId);
+            await logEvent("room_assigned", { matchId: locked.matchId, roomPoolId: room.roomPoolId }, null, locked.matchId);
+          } else {
+            console.log("[room] no unused room available");
+            await logEvent("room_empty", { matchId: locked.matchId }, null, locked.matchId);
+          }
+        } else {
+          console.log("[room] already assigned for match", locked.matchId);
+        }
       } catch (e) {
-        console.error("[room] ensure room failed:", e?.message || e);
-        await logEvent("room_ensure_failed", { matchId: locked.matchId, err: e?.message || String(e) }, null, locked.matchId);
+        console.error("[room] assign failed:", e?.message || e);
+        await logEvent("room_assign_failed", { matchId: locked.matchId, err: e?.message || String(e) }, null, locked.matchId);
       }
+
     } catch (dbErr) {
       console.error("[match] DB write failed AFTER lockMatch:", dbErr?.message || dbErr);
       await logEvent("db_write_failed_after_lock", { matchId: locked.matchId, err: dbErr?.message || String(dbErr) });
     }
+
   } catch (e) {
     console.error("[match] tick error:", e?.message || e);
   } finally {
@@ -568,6 +593,48 @@ async function readJson(req) {
     });
   });
 }
+
+async function claimRoomFromPool(matchId) {
+  // 1) 取一条 unused
+  const { data: rows, error: qErr } = await supabase
+    .from("room_pool")
+    .select("id,launch_blue,launch_red,ull_roomid")
+    .eq("status", "unused")
+    .order("created_at", { ascending: true })
+    .limit(1);
+
+  if (qErr) throw qErr;
+  const r = rows?.[0];
+  if (!r) return null;
+
+  // 2) 先把 room_pool 标记 used（避免并发重复用）
+  const { data: upd, error: uErr } = await supabase
+    .from("room_pool")
+    .update({ status: "used", used_at: nowIso(), used_by_wallet: null })
+    .eq("id", r.id)
+    .eq("status", "unused")
+    .select("id");
+
+  if (uErr) throw uErr;
+  if (!upd || upd.length === 0) return null; // 被别人抢了
+
+  // 3) 写入 matches（把蓝/红两条 deeplink 绑到这一局）
+  const { error: mErr } = await supabase
+    .from("matches")
+    .update({
+      room_pool_id: r.id,
+      launch_blue: r.launch_blue,
+      launch_red: r.launch_red,
+      room_assigned_at: nowIso()
+    })
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("chain_match_id", Number(matchId));
+
+  if (mErr) throw mErr;
+
+  return { roomPoolId: r.id, launchBlue: r.launch_blue, launchRed: r.launch_red, ullRoomid: r.ull_roomid };
+}
+
 
 async function handle(req, res) {
   setCors(res);
@@ -799,6 +866,58 @@ async function handle(req, res) {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true, ullRoomid: r.ull_roomid, side, launchUrl }));
     }
+
+    if (req.method === "GET" && path === "/api/room/join") {
+        const w = lc(u.searchParams.get("wallet") || "");
+        if (!w) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+        }
+
+        // 找我参与的、未 resolved 的 match
+        const { data: ms, error: mErr } = await supabase
+          .from("matches")
+          .select("chain_match_id,player_a,player_b,status,launch_blue,launch_red,room_pool_id,side_a,side_b")
+          .eq("contract_address", CONTRACT_ADDRESS)
+          .or(`player_a.eq.${w},player_b.eq.${w}`)
+          .neq("status", "resolved")
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (mErr) throw mErr;
+        const m = ms?.[0];
+        if (!m) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ ok: false, error: "no active match" }));
+        }
+
+        // A 蓝 B 红（固定）
+        const isA = lc(m.player_a) === w;
+        const side = isA ? "blue" : "red";
+
+        // 如果这一局还没分配房间，尝试立刻分配一次
+        if (!m.launch_blue || !m.launch_red) {
+          const room = await claimRoomFromPool(Number(m.chain_match_id));
+          if (!room) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ ok: false, error: "room not ready yet (pool empty)" }));
+          }
+
+          // 重新读一遍 match（或直接用 room 返回值也行）
+          m.launch_blue = room.launchBlue;
+          m.launch_red = room.launchRed;
+        }
+
+        const launchUrl = side === "blue" ? m.launch_blue : m.launch_red;
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({
+          ok: true,
+          matchId: Number(m.chain_match_id),
+          side,
+          launchUrl
+        }));
+      }
 
 
     // ---- state ----
