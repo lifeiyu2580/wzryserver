@@ -437,35 +437,54 @@ async function scanRecentMatchLockedEvents() {
   const fromBase = Math.max(0, latest - PRUNED_WINDOW);
   const filter = contract.filters.MatchLocked();
 
-  for (let from = fromBase; from <= latest; from += EVENT_SCAN_STEP + 1) {
-    const to = Math.min(latest, from + EVENT_SCAN_STEP);
+  // 动态分段扫描：遇到 413 就自动缩小区间
+  async function scanRange(from, to) {
+    if (from > to) return;
 
-    let logs = [];
     try {
-      logs = await contract.queryFilter(filter, from, to);
-    } catch (e) {
-      const msg = (e?.shortMessage || e?.message || "").toLowerCase();
-      console.error("[sync] getLogs failed range", from, to, msg);
-      return;
-    }
+      const logs = await contract.queryFilter(filter, from, to);
 
-    for (const ev of logs) {
-      const matchId = Number(ev.args.matchId);
-      const a = lc(ev.args.a);
-      const b = lc(ev.args.b);
+      for (const ev of logs) {
+        const matchId = Number(ev.args.matchId);
+        const a = lc(ev.args.a);
+        const b = lc(ev.args.b);
 
-      try {
-        await upsertMatch(matchId, a, b, "locking");
-        await markQueueMatched(a, b);
-
-        // ✅ NEW: 事件补写时也尝试补齐房间（失败忽略）
-        try { await ensureRoomForMatch({ matchId, a, b }); } catch {}
-      } catch (err) {
-        console.error("[sync] backfill failed:", matchId, err?.message || err);
+        try {
+          await upsertMatch(matchId, a, b, "locking");
+          await markQueueMatched(a, b);
+        } catch (err) {
+          console.error("[sync] backfill failed:", matchId, err?.message || err);
+        }
       }
+
+      return;
+    } catch (e) {
+      const msg = String(e?.shortMessage || e?.message || "").toLowerCase();
+
+      // QuickNode / 一些节点会用 413 拒绝返回过大的 logs
+      const is413 = msg.includes("413") || msg.includes("request entity too large");
+
+      // 只有 413 才分裂；其它错误直接抛出去让外层打印
+      if (!is413) throw e;
+
+      // 区间太大：二分
+      const mid = Math.floor((from + to) / 2);
+      if (mid <= from) {
+        // 已经缩到最小还 413，说明这个区块单块 logs 都太多（极少）
+        console.error("[sync] getLogs still 413 even for tiny range", from, to);
+        return;
+      }
+
+      console.warn("[sync] getLogs 413, split range:", from, to, "->", from, mid, "and", mid + 1, to);
+      await scanRange(from, mid);
+      await scanRange(mid + 1, to);
     }
   }
+
+  // 这里不用固定 step 了，直接扫整个窗口，由 scanRange 自动拆
+  await scanRange(fromBase, latest);
 }
+
 
 async function syncMatchStatuses() {
   const { data, error } = await supabase
@@ -823,50 +842,6 @@ async function handle(req, res) {
       return res.end(JSON.stringify({ ok: true, ullRoomid, launch_blue, launch_red }));
     }
 
-    if (req.method === "GET" && path === "/api/roompool/claim") {
-      const w = lc(u.searchParams.get("wallet") || "");
-      const side = (u.searchParams.get("side") || "blue") === "red" ? "red" : "blue";
-      if (!w) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
-      }
-
-      // 1) 取最早的 unused
-      const { data: rows, error: qErr } = await supabase
-        .from("room_pool")
-        .select("id,launch_blue,launch_red,ull_roomid")
-        .eq("status", "unused")
-        .order("created_at", { ascending: true })
-        .limit(1);
-
-      if (qErr) throw qErr;
-      const r = rows?.[0];
-      if (!r) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "no unused room" }));
-      }
-
-      // 2) 标记 used（带 status=unused 条件，避免重复用）
-      const { data: upd, error: uErr } = await supabase
-        .from("room_pool")
-        .update({ status: "used", used_at: nowIso(), used_by_wallet: w })
-        .eq("id", r.id)
-        .eq("status", "unused")
-        .select("id");
-
-      if (uErr) throw uErr;
-      if (!upd || upd.length === 0) {
-        // 被并发抢了
-        res.writeHead(409, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "race, try again" }));
-      }
-
-      const launchUrl = side === "red" ? r.launch_red : r.launch_blue;
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, ullRoomid: r.ull_roomid, side, launchUrl }));
-    }
-
     if (req.method === "GET" && path === "/api/room/join") {
         const w = lc(u.searchParams.get("wallet") || "");
         if (!w) {
@@ -877,13 +852,12 @@ async function handle(req, res) {
         // 找我参与的、未 resolved 的 match
         const { data: ms, error: mErr } = await supabase
           .from("matches")
-          .select("chain_match_id,player_a,player_b,status,launch_blue,launch_red,room_pool_id,side_a,side_b")
+          .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at,room_id,side_a,side_b")
           .eq("contract_address", CONTRACT_ADDRESS)
           .or(`player_a.eq.${w},player_b.eq.${w}`)
-          .neq("status", "resolved")
+          .in("status", ["locking", "disputed"])   // ✅ 只认进行中
           .order("created_at", { ascending: false })
           .limit(1);
-
         if (mErr) throw mErr;
         const m = ms?.[0];
         if (!m) {
@@ -941,7 +915,7 @@ async function handle(req, res) {
         .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at,room_id,side_a,side_b")
         .eq("contract_address", CONTRACT_ADDRESS)
         .or(`player_a.eq.${w},player_b.eq.${w}`)
-        .neq("status", "resolved")
+        .in("status", ["locking", "disputed"])   // ✅ 只认进行中
         .order("created_at", { ascending: false })
         .limit(1);
       if (mErr) throw mErr;
