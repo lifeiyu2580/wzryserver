@@ -614,7 +614,28 @@ async function readJson(req) {
 }
 
 async function claimRoomFromPool(matchId) {
-  // 1) 取一条 unused
+  const mid = Number(matchId);
+
+  // 0) 先看看这局是否已经分配过（幂等：已分配就直接返回）
+  const { data: existing, error: e0 } = await supabase
+    .from("matches")
+    .select("room_pool_id,launch_blue,launch_red")
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("chain_match_id", mid)
+    .maybeSingle();
+
+  if (e0) throw e0;
+
+  if (existing?.launch_blue && existing?.launch_red) {
+    return {
+      roomPoolId: existing.room_pool_id || null,
+      launchBlue: existing.launch_blue,
+      launchRed: existing.launch_red,
+      ullRoomid: null
+    };
+  }
+
+  // 1) 取一条 unused（尽量最老的）
   const { data: rows, error: qErr } = await supabase
     .from("room_pool")
     .select("id,launch_blue,launch_red,ull_roomid")
@@ -626,7 +647,7 @@ async function claimRoomFromPool(matchId) {
   const r = rows?.[0];
   if (!r) return null;
 
-  // 2) 先把 room_pool 标记 used（避免并发重复用）
+  // 2) 抢占：把 room_pool 标 used（避免并发重复用）
   const { data: upd, error: uErr } = await supabase
     .from("room_pool")
     .update({ status: "used", used_at: nowIso(), used_by_wallet: null })
@@ -635,10 +656,10 @@ async function claimRoomFromPool(matchId) {
     .select("id");
 
   if (uErr) throw uErr;
-  if (!upd || upd.length === 0) return null; // 被别人抢了
+  if (!upd || upd.length === 0) return null; // 被别人抢了，外层可重试
 
-  // 3) 写入 matches（把蓝/红两条 deeplink 绑到这一局）
-  const { error: mErr } = await supabase
+  // 3) 写入 matches：只允许“未分配”的局写入，避免重复 join 覆盖
+  const { data: mUpd, error: mErr } = await supabase
     .from("matches")
     .update({
       room_pool_id: r.id,
@@ -647,12 +668,66 @@ async function claimRoomFromPool(matchId) {
       room_assigned_at: nowIso()
     })
     .eq("contract_address", CONTRACT_ADDRESS)
-    .eq("chain_match_id", Number(matchId));
+    .eq("chain_match_id", mid)
+    .is("room_pool_id", null)          // ✅ 关键：只在未分配时才允许更新
+    .is("launch_blue", null)
+    .is("launch_red", null)
+    .select("room_pool_id,launch_blue,launch_red");
 
-  if (mErr) throw mErr;
+  if (mErr) {
+    // matches 更新失败：尽量把 room_pool 回收
+    try {
+      await supabase
+        .from("room_pool")
+        .update({ status: "unused", used_at: null, used_by_wallet: null })
+        .eq("id", r.id)
+        .eq("status", "used");
+    } catch {}
+    throw mErr;
+  }
 
-  return { roomPoolId: r.id, launchBlue: r.launch_blue, launchRed: r.launch_red, ullRoomid: r.ull_roomid };
+  // 如果 0 行被更新，说明这局刚刚已经被别人分配了
+  if (!mUpd || mUpd.length === 0) {
+    // 回收我们刚抢到的 pool（避免浪费）
+    try {
+      await supabase
+        .from("room_pool")
+        .update({ status: "unused", used_at: null, used_by_wallet: null })
+        .eq("id", r.id)
+        .eq("status", "used");
+    } catch {}
+
+    // 再读一次 matches，把已经分配好的返回
+    const { data: again, error: e2 } = await supabase
+      .from("matches")
+      .select("room_pool_id,launch_blue,launch_red")
+      .eq("contract_address", CONTRACT_ADDRESS)
+      .eq("chain_match_id", mid)
+      .maybeSingle();
+    if (e2) throw e2;
+
+    if (again?.launch_blue && again?.launch_red) {
+      return {
+        roomPoolId: again.room_pool_id || null,
+        launchBlue: again.launch_blue,
+        launchRed: again.launch_red,
+        ullRoomid: null
+      };
+    }
+
+    // 理论上很少：刚好还没写上
+    return null;
+  }
+
+  // 正常返回
+  return {
+    roomPoolId: r.id,
+    launchBlue: r.launch_blue,
+    launchRed: r.launch_red,
+    ullRoomid: r.ull_roomid
+  };
 }
+
 
 
 async function handle(req, res) {
@@ -843,55 +918,66 @@ async function handle(req, res) {
     }
 
     if (req.method === "GET" && path === "/api/room/join") {
-        const w = lc(u.searchParams.get("wallet") || "");
-        if (!w) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
-        }
+      const w = lc(u.searchParams.get("wallet") || "");
+      if (!w) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+      }
 
-        // 找我参与的、未 resolved 的 match
-        const { data: ms, error: mErr } = await supabase
-          .from("matches")
-          .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at,room_id,side_a,side_b")
-          .eq("contract_address", CONTRACT_ADDRESS)
-          .or(`player_a.eq.${w},player_b.eq.${w}`)
-          .in("status", ["locking", "disputed"])   // ✅ 只认进行中
-          .order("created_at", { ascending: false })
-          .limit(1);
-        if (mErr) throw mErr;
-        const m = ms?.[0];
-        if (!m) {
-          res.writeHead(404, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ ok: false, error: "no active match" }));
-        }
+      // 找我参与的、进行中的 match（只认进行中）
+      const { data: ms, error: mErr } = await supabase
+        .from("matches")
+        .select("chain_match_id,player_a,player_b,status,room_pool_id,launch_blue,launch_red")
+        .eq("contract_address", CONTRACT_ADDRESS)
+        .or(`player_a.eq.${w},player_b.eq.${w}`)
+        .in("status", ["locking", "disputed"])
+        .order("created_at", { ascending: false })
+        .limit(1);
 
-        // A 蓝 B 红（固定）
-        const isA = lc(m.player_a) === w;
-        const side = isA ? "blue" : "red";
+      if (mErr) throw mErr;
 
-        // 如果这一局还没分配房间，尝试立刻分配一次
-        if (!m.launch_blue || !m.launch_red) {
-          const room = await claimRoomFromPool(Number(m.chain_match_id));
-          if (!room) {
-            res.writeHead(409, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ ok: false, error: "room not ready yet (pool empty)" }));
-          }
+      let m = ms?.[0];
+      if (!m) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "no active match" }));
+      }
 
-          // 重新读一遍 match（或直接用 room 返回值也行）
-          m.launch_blue = room.launchBlue;
-          m.launch_red = room.launchRed;
-        }
+      // A 蓝 B 红（固定）
+      const isA = lc(m.player_a) === w;
+      const side = isA ? "blue" : "red";
 
+      // ✅ 1) 如果已经有 deeplink：直接返回（重复点击不会再分配）
+      if (m.launch_blue && m.launch_red) {
         const launchUrl = side === "blue" ? m.launch_blue : m.launch_red;
-
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({
           ok: true,
           matchId: Number(m.chain_match_id),
           side,
-          launchUrl
+          launchUrl,
+          reused: true
         }));
       }
+
+      // ✅ 2) 没有才尝试 claim（claimRoomFromPool 内部已经做了幂等 + 并发安全）
+      const room = await claimRoomFromPool(Number(m.chain_match_id));
+      if (!room || !room.launchBlue || !room.launchRed) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "room not ready yet (pool empty or assigning)" }));
+      }
+
+      const launchUrl = side === "blue" ? room.launchBlue : room.launchRed;
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        ok: true,
+        matchId: Number(m.chain_match_id),
+        side,
+        launchUrl,
+        reused: false
+      }));
+    }
+
 
 
     // ---- state ----
