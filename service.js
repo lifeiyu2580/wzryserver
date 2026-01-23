@@ -582,7 +582,7 @@ async function tickSync() {
   syncBusy = true;
 
   try {
-    await scanRecentMatchLockedEvents();
+    // await scanRecentMatchLockedEvents();
     await syncMatchStatuses();
     await fixQueueAndPending();
   } catch (e) {
