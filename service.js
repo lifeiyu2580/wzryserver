@@ -53,6 +53,47 @@ const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 function lc(addr) { return (addr || "").toLowerCase(); }
 function nowIso() { return new Date().toISOString(); }
 
+// ===== Rate limit (in-memory) + state cache =====
+const RATE = {
+  state_ip:   { windowMs: 10_000, limit: 10 }, // 10 req / 10s per IP
+  state_wallet:{ windowMs: 10_000, limit: 4 }, // 4 req / 10s per wallet
+  write_wallet:{ windowMs: 30_000, limit: 2 }, // 2 req / 30s per wallet (enqueue/leave)
+  join_wallet: { windowMs: 30_000, limit: 3 }, // 3 req / 30s per wallet (room/join)
+};
+
+const buckets = new Map(); // key -> { resetAt, count }
+
+function hitLimit(key, rule) {
+  const now = Date.now();
+  const b = buckets.get(key);
+  if (!b || now > b.resetAt) {
+    buckets.set(key, { resetAt: now + rule.windowMs, count: 1 });
+    return false;
+  }
+  b.count += 1;
+  return b.count > rule.limit;
+}
+
+function getClientIp(req) {
+  // Render / Cloudflare 可能会带 x-forwarded-for
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.length) return xf.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+
+// /api/state cache: wallet -> { expAt, jsonString }
+const stateCache = new Map();
+function cacheGet(wallet) {
+  const v = stateCache.get(wallet);
+  if (!v) return null;
+  if (Date.now() > v.expAt) { stateCache.delete(wallet); return null; }
+  return v.body;
+}
+function cacheSet(wallet, body, ttlMs = 2000) {
+  stateCache.set(wallet, { expAt: Date.now() + ttlMs, body });
+}
+
+
 async function logEvent(type, payload = {}, walletAddr = null, matchId = null) {
   try {
     await supabase.from("events").insert({
@@ -739,6 +780,7 @@ async function handle(req, res) {
 
   const u = new URL(req.url, "http://localhost");
   const path = u.pathname;
+  const ip = getClientIp(req);
 
   try {
     if (req.method === "GET" && (path === "/" || path === "/health")) {
@@ -856,34 +898,118 @@ async function handle(req, res) {
     }
 
     // ---- queue apis ----
-    if (req.method === "POST" && path === "/api/queue/enqueue") {
-      const { wallet: w, txHash } = await readJson(req);
-      if (!w || !txHash) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
-      }
+if (req.method === "POST" && path === "/api/queue/enqueue") {
+  const { wallet: w, txHash } = await readJson(req);
+  if (!w || !txHash) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
+  }
 
-      await upsertQueue(w, { status: "pending_enqueue", enqueue_tx: txHash });
-      await logEvent("api_enqueue", { txHash }, w);
+  const wallet = lc(w);
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true }));
-    }
+  // ✅ 限流：同一钱包 30 秒最多 2 次写操作（enqueue/leave 共用）
+  if (hitLimit(`w:write:${wallet}`, RATE.write_wallet)) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "10" });
+    return res.end(JSON.stringify({ ok: false, error: "rate limited" }));
+  }
 
-    if (req.method === "POST" && path === "/api/queue/leave") {
-      const { wallet: w, txHash } = await readJson(req);
-      if (!w || !txHash) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
-      }
+  await upsertQueue(wallet, { status: "pending_enqueue", enqueue_tx: txHash });
+  await logEvent("api_enqueue", { txHash }, wallet);
 
-      await upsertQueue(w, { status: "pending_leave", leave_tx: txHash });
-      await logEvent("api_leave", { txHash }, w);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ ok: true }));
+}
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true }));
-    }
-    
+if (req.method === "POST" && path === "/api/queue/leave") {
+  const { wallet: w, txHash } = await readJson(req);
+  if (!w || !txHash) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet/txHash" }));
+  }
+
+  const wallet = lc(w);
+
+  // ✅ 限流：同一钱包 30 秒最多 2 次写操作（enqueue/leave 共用）
+  if (hitLimit(`w:write:${wallet}`, RATE.write_wallet)) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "10" });
+    return res.end(JSON.stringify({ ok: false, error: "rate limited" }));
+  }
+
+  await upsertQueue(wallet, { status: "pending_leave", leave_tx: txHash });
+  await logEvent("api_leave", { txHash }, wallet);
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ ok: true }));
+}
+
+// ---- room join ----
+if (req.method === "GET" && path === "/api/room/join") {
+  const w = lc(u.searchParams.get("wallet") || "");
+  if (!w) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+  }
+
+  // ✅ 限流：同一钱包 30 秒最多 3 次 join（防狂点）
+  if (hitLimit(`w:join:${w}`, RATE.join_wallet)) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "10" });
+    return res.end(JSON.stringify({ ok: false, error: "rate limited" }));
+  }
+
+  // 找我参与的、进行中的 match（只认进行中）
+  const { data: ms, error: mErr } = await supabase
+    .from("matches")
+    .select("chain_match_id,player_a,player_b,status,room_pool_id,launch_blue,launch_red")
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .or(`player_a.eq.${w},player_b.eq.${w}`)
+    .in("status", ["locking", "disputed"])
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (mErr) throw mErr;
+
+  const m = ms?.[0];
+  if (!m) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "no active match" }));
+  }
+
+  // A 蓝 B 红（固定）
+  const isA = lc(m.player_a) === w;
+  const side = isA ? "blue" : "red";
+
+  // ✅ 1) 已经有 deeplink：直接返回（重复点击不会再分配）
+  if (m.launch_blue && m.launch_red) {
+    const launchUrl = side === "blue" ? m.launch_blue : m.launch_red;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      matchId: Number(m.chain_match_id),
+      side,
+      launchUrl,
+      reused: true
+    }));
+  }
+
+  // ✅ 2) 没有才尝试 claim（claimRoomFromPool 内部已做并发安全）
+  const room = await claimRoomFromPool(Number(m.chain_match_id));
+  if (!room || !room.launchBlue || !room.launchRed) {
+    res.writeHead(409, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "room not ready yet (pool empty or assigning)" }));
+  }
+
+  const launchUrl = side === "blue" ? room.launchBlue : room.launchRed;
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    ok: true,
+    matchId: Number(m.chain_match_id),
+    side,
+    launchUrl,
+    reused: false
+  }));
+}
+
     if (req.method === "POST" && path === "/api/roompool/add") {
       const { launchUrl } = await readJson(req);
       if (!launchUrl) {
@@ -917,127 +1043,89 @@ async function handle(req, res) {
       return res.end(JSON.stringify({ ok: true, ullRoomid, launch_blue, launch_red }));
     }
 
-    if (req.method === "GET" && path === "/api/room/join") {
-      const w = lc(u.searchParams.get("wallet") || "");
-      if (!w) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
-      }
-
-      // 找我参与的、进行中的 match（只认进行中）
-      const { data: ms, error: mErr } = await supabase
-        .from("matches")
-        .select("chain_match_id,player_a,player_b,status,room_pool_id,launch_blue,launch_red")
-        .eq("contract_address", CONTRACT_ADDRESS)
-        .or(`player_a.eq.${w},player_b.eq.${w}`)
-        .in("status", ["locking", "disputed"])
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (mErr) throw mErr;
-
-      let m = ms?.[0];
-      if (!m) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "no active match" }));
-      }
-
-      // A 蓝 B 红（固定）
-      const isA = lc(m.player_a) === w;
-      const side = isA ? "blue" : "red";
-
-      // ✅ 1) 如果已经有 deeplink：直接返回（重复点击不会再分配）
-      if (m.launch_blue && m.launch_red) {
-        const launchUrl = side === "blue" ? m.launch_blue : m.launch_red;
-        res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({
-          ok: true,
-          matchId: Number(m.chain_match_id),
-          side,
-          launchUrl,
-          reused: true
-        }));
-      }
-
-      // ✅ 2) 没有才尝试 claim（claimRoomFromPool 内部已经做了幂等 + 并发安全）
-      const room = await claimRoomFromPool(Number(m.chain_match_id));
-      if (!room || !room.launchBlue || !room.launchRed) {
-        res.writeHead(409, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "room not ready yet (pool empty or assigning)" }));
-      }
-
-      const launchUrl = side === "blue" ? room.launchBlue : room.launchRed;
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({
-        ok: true,
-        matchId: Number(m.chain_match_id),
-        side,
-        launchUrl,
-        reused: false
-      }));
-    }
-
-
-
     // ---- state ----
     if (req.method === "GET" && path === "/api/state") {
-      const w = lc(u.searchParams.get("wallet") || "");
-      if (!w) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
-      }
+  const w = lc(u.searchParams.get("wallet") || "");
+  if (!w) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+  }
 
-      const { data: q, error: qErr } = await supabase
-        .from("queue")
-        .select("status,enqueue_tx,leave_tx,updated_at")
-        .eq("contract_address", CONTRACT_ADDRESS)
-        .eq("wallet", w)
-        .maybeSingle();
-      if (qErr) throw qErr;
+  // rate limit
+  if (hitLimit(`ip:state:${ip}`, RATE.state_ip) || hitLimit(`w:state:${w}`, RATE.state_wallet)) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "5" });
+    return res.end(JSON.stringify({ ok: false, error: "rate limited" }));
+  }
 
-      const { data: ms, error: mErr } = await supabase
-        .from("matches")
-        .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at,room_id,side_a,side_b")
-        .eq("contract_address", CONTRACT_ADDRESS)
-        .or(`player_a.eq.${w},player_b.eq.${w}`)
-        .in("status", ["locking", "disputed"])   // ✅ 只认进行中
-        .order("created_at", { ascending: false })
-        .limit(1);
-      if (mErr) throw mErr;
+  // cache
+  const cached = cacheGet(w);
+  if (cached) {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "private, max-age=2"
+    });
+    return res.end(cached);
+  }
 
-      const { data: meProf, error: meErr } = await supabase
-        .from("player_profiles")
-        .select("wallet,game_name")
-        .eq("wallet", w)
-        .maybeSingle();
-      if (meErr) throw meErr;
+  const { data: q, error: qErr } = await supabase
+    .from("queue")
+    .select("status,enqueue_tx,leave_tx,updated_at")
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("wallet", w)
+    .maybeSingle();
+  if (qErr) throw qErr;
 
-      let oppProf = null;
-      const m = (ms && ms[0]) ? ms[0] : null;
-      if (m) {
-        const a = lc(m.player_a);
-        const b = lc(m.player_b);
-        const oppWallet = (a === w) ? b : a;
+  const { data: ms, error: mErr } = await supabase
+    .from("matches")
+    .select("chain_match_id,player_a,player_b,status,winner,dispute_by,updated_at,room_pool_id,launch_blue,launch_red")
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .or(`player_a.eq.${w},player_b.eq.${w}`)
+    .in("status", ["locking", "disputed"]) // ✅ 只返回进行中，避免“乱跳回旧对局”
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (mErr) throw mErr;
 
-        const { data: o, error: oErr } = await supabase
-          .from("player_profiles")
-          .select("wallet,game_name")
-          .eq("wallet", oppWallet)
-          .maybeSingle();
-        if (oErr) throw oErr;
-        oppProf = o || null;
-      }
+  const { data: meProf, error: meErr } = await supabase
+    .from("player_profiles")
+    .select("wallet,game_name")
+    .eq("wallet", w)
+    .maybeSingle();
+  if (meErr) throw meErr;
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({
-        ok: true,
-        queue: q || null,
-        match: (ms && ms[0]) || null,
-        meProfile: meProf || null,
-        opponentProfile: oppProf
-      }));
-    }
+  let oppProf = null;
+  const m = (ms && ms[0]) ? ms[0] : null;
+  if (m) {
+    const a = lc(m.player_a);
+    const b = lc(m.player_b);
+    const oppWallet = (a === w) ? b : a;
+
+    const { data: o, error: oErr } = await supabase
+      .from("player_profiles")
+      .select("wallet,game_name")
+      .eq("wallet", oppWallet)
+      .maybeSingle();
+    if (oErr) throw oErr;
+    oppProf = o || null;
+  }
+
+  const bodyObj = {
+    ok: true,
+    queue: q || null,
+    match: (ms && ms[0]) || null,
+    meProfile: meProf || null,
+    opponentProfile: oppProf
+  };
+  const body = JSON.stringify(bodyObj);
+
+  cacheSet(w, body, 2000);
+
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    "Cache-Control": "private, max-age=2"
+  });
+  return res.end(body);
+}
+
 
     res.writeHead(404, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: false, error: "not found" }));
