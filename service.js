@@ -1010,6 +1010,109 @@ if (req.method === "GET" && path === "/api/room/join") {
   }));
 }
 
+    // ---- match history (paged) ----
+// GET /api/match/history?wallet=0x...&page=1&pageSize=10
+if (req.method === "GET" && path === "/api/match/history") {
+  const w = lc(u.searchParams.get("wallet") || "");
+  if (!w) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "missing wallet" }));
+  }
+
+  // page/pageSize
+  const page = Math.max(1, Number(u.searchParams.get("page") || 1));
+  const pageSizeRaw = Number(u.searchParams.get("pageSize") || 10);
+  const pageSize = Math.min(50, Math.max(1, pageSizeRaw)); // 最多 50/页，防止被刷爆
+  const from = (page - 1) * pageSize;
+  const to = from + pageSize - 1;
+
+  // 1) 查 matches（只取已结束 resolved）
+  const { data: ms, error: mErr, count } = await supabase
+    .from("matches")
+    .select(
+      "chain_match_id,player_a,player_b,status,winner,created_at",
+      { count: "exact" }
+    )
+    .eq("contract_address", CONTRACT_ADDRESS)
+    .eq("status", "resolved")
+    .or(`player_a.eq.${w},player_b.eq.${w}`)
+    .order("created_at", { ascending: false })
+    .range(from, to);
+
+  if (mErr) throw mErr;
+
+  const matches = ms || [];
+  if (matches.length === 0) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      page,
+      pageSize,
+      total: count || 0,
+      rows: []
+    }));
+  }
+
+  // 2) 批量取 profiles（我 + 对手们）
+  const wallets = new Set();
+  wallets.add(w);
+  for (const m of matches) {
+    wallets.add(lc(m.player_a));
+    wallets.add(lc(m.player_b));
+  }
+  const walletList = Array.from(wallets);
+
+  const { data: ps, error: pErr } = await supabase
+    .from("player_profiles")
+    .select("wallet,game_name")
+    .in("wallet", walletList);
+
+  if (pErr) throw pErr;
+
+  const nameMap = new Map();
+  for (const p of (ps || [])) {
+    nameMap.set(lc(p.wallet), p.game_name);
+  }
+
+  // 3) 组装 rows
+  const rows = matches.map(m => {
+    const a = lc(m.player_a);
+    const b = lc(m.player_b);
+    const opp = (a === w) ? b : a;
+
+    const meName = nameMap.get(w) || w;
+    const oppName = nameMap.get(opp) || opp;
+
+    const winner = lc(m.winner || "");
+    let result = "unknown";
+    if (!winner || winner === lc(ethers.ZeroAddress)) {
+      // winner 为空/零地址：你可以认为是未知或平局
+      result = "unknown";
+    } else {
+      result = (winner === w) ? "win" : "lose";
+    }
+
+    return {
+      chain_match_id: Number(m.chain_match_id),
+      result,
+      me: meName,
+      opponent: oppName,
+      opponent_wallet: opp,
+      created_at: m.created_at
+    };
+  });
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    ok: true,
+    page,
+    pageSize,
+    total: count || 0,
+    rows
+  }));
+}
+
+
     if (req.method === "POST" && path === "/api/roompool/add") {
       const { launchUrl } = await readJson(req);
       if (!launchUrl) {
