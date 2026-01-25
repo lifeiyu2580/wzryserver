@@ -530,7 +530,7 @@ async function scanRecentMatchLockedEvents() {
 async function syncMatchStatuses() {
   const { data, error } = await supabase
     .from("matches")
-    .select("chain_match_id,status")
+    .select("chain_match_id,status,resolved_at")
     .eq("contract_address", CONTRACT_ADDRESS)
     .in("status", ["locking", "disputed"])
     .order("created_at", { ascending: true })
@@ -541,6 +541,7 @@ async function syncMatchStatuses() {
 
   for (const row of data) {
     const mid = Number(row.chain_match_id);
+
     let res;
     try {
       res = await contract.getMatch(mid);
@@ -554,18 +555,34 @@ async function syncMatchStatuses() {
 
     if (want !== row.status) {
       console.log("[sync] match", mid, row.status, "->", want);
-      const winner = lc(res[9]);
-      const disputedBy = lc(res[7]);
+
+      const winner = lc(res[9]);      // winner address
+      const disputedBy = lc(res[7]);  // disputedBy address
 
       const patch = { status: want };
-      if (want === "resolved" && winner && winner !== ethers.ZeroAddress) patch.winner = winner;
-      if (want === "disputed" && disputedBy && disputedBy !== ethers.ZeroAddress) patch.dispute_by = disputedBy;
+
+      // ✅ winner / dispute_by
+      if (want === "resolved" && winner && winner !== ethers.ZeroAddress) {
+        patch.winner = winner;
+      }
+      if (want === "disputed" && disputedBy && disputedBy !== ethers.ZeroAddress) {
+        patch.dispute_by = disputedBy;
+      }
+
+      // ✅ 关键：只在“首次进入 resolved”时写 resolved_at（避免后续 sync 把这局“挪到下一周”）
+      if (want === "resolved") {
+        // row.resolved_at 来自本次 select（如果你历史已补齐，它一般不为 null）
+        if (!row.resolved_at) {
+          patch.resolved_at = nowIso();
+        }
+      }
 
       await updateMatch(mid, patch);
       await logEvent("match_status_sync", { mid, from: row.status, to: want }, null, mid);
     }
   }
 }
+
 
 const lastCheck = new Map(); // wallet -> count
 
@@ -1110,6 +1127,53 @@ if (req.method === "GET" && path === "/api/match/history") {
     total: count || 0,
     rows
   }));
+}
+
+  if (req.method === "GET" && path === "/api/leaderboard") {
+  try {
+    const week = (u.searchParams.get("week") || "THIS").toUpperCase();
+    const page = Math.max(1, Number(u.searchParams.get("page") || 1));
+    const pageSize = Math.min(50, Math.max(1, Number(u.searchParams.get("pageSize") || 10)));
+    const offset = (page - 1) * pageSize;
+
+    // 目前只支持 THIS（本周）
+    if (week !== "THIS") {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, error: "only THIS week supported" }));
+    }
+
+    // 本周周一 00:00（与你 view 的 date_trunc('week') 对齐）
+    const now = new Date();
+    const weekStart = new Date(now);
+    weekStart.setHours(0, 0, 0, 0);
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));
+    const weekISO = weekStart.toISOString();
+
+    // ✅ 查询 leaderboard_weekly（纯胜场榜）
+    const { data, error, count } = await supabase
+      .from("leaderboard_weekly")
+      .select("wallet,wins,loses,score,games", { count: "exact" })
+      .eq("week_start", weekISO)
+      .order("wins", { ascending: false })     // ⭐ 纯胜场
+      .order("games", { ascending: true })     // 同胜场时：场次少的靠前（可选）
+      .range(offset, offset + pageSize - 1);
+
+    if (error) throw error;
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      week: weekISO,
+      page,
+      pageSize,
+      total: count || 0,
+      rows: data || []
+    }));
+  } catch (e) {
+    console.error("[leaderboard]", e);
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "internal error" }));
+  }
 }
 
 
