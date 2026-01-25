@@ -1130,52 +1130,68 @@ if (req.method === "GET" && path === "/api/match/history") {
 }
 
   if (req.method === "GET" && path === "/api/leaderboard") {
-  try {
-    const week = (u.searchParams.get("week") || "THIS").toUpperCase();
-    const page = Math.max(1, Number(u.searchParams.get("page") || 1));
-    const pageSize = Math.min(50, Math.max(1, Number(u.searchParams.get("pageSize") || 10)));
-    const offset = (page - 1) * pageSize;
+  const week = (u.searchParams.get("week") || "THIS").toUpperCase();
+  // 你只要前十，不分页
+  const pageSize = 10;
 
-    // 目前只支持 THIS（本周）
-    if (week !== "THIS") {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: false, error: "only THIS week supported" }));
-    }
+  // 算本周 week_start（跟你 view 的 date_trunc('week') 对齐）
+  // Supabase/Postgres 的 date_trunc('week') 默认按周一开始（ISO week）
+  const now = new Date();
+  const day = (now.getUTCDay() + 6) % 7; // 把周日(0)转换到最后：周一=0...周日=6
+  const weekStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - day));
+  weekStart.setUTCHours(0, 0, 0, 0);
 
-    // 本周周一 00:00（与你 view 的 date_trunc('week') 对齐）
-    const now = new Date();
-    const weekStart = new Date(now);
-    weekStart.setHours(0, 0, 0, 0);
-    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));
-    const weekISO = weekStart.toISOString();
-
-    // ✅ 查询 leaderboard_weekly（纯胜场榜）
-    const { data, error, count } = await supabase
-      .from("leaderboard_weekly")
-      .select("wallet,wins,loses,score,games", { count: "exact" })
-      .eq("week_start", weekISO)
-      .order("wins", { ascending: false })     // ⭐ 纯胜场
-      .order("games", { ascending: true })     // 同胜场时：场次少的靠前（可选）
-      .range(offset, offset + pageSize - 1);
-
-    if (error) throw error;
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({
-      ok: true,
-      week: weekISO,
-      page,
-      pageSize,
-      total: count || 0,
-      rows: data || []
-    }));
-  } catch (e) {
-    console.error("[leaderboard]", e);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "internal error" }));
+  // 只支持 THIS（你以后要 LAST 再加）
+  if (week !== "THIS") {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "only week=THIS supported for now" }));
   }
-}
 
+  // 1) 取本周 top10（先按 wins，其次 score，其次 games）
+  const { data: rows, error } = await supabase
+    .from("leaderboard_weekly")
+    .select("wallet,wins,loses,score,games,week_start")
+    .eq("week_start", weekStart.toISOString())
+    .order("wins", { ascending: false })
+    .order("score", { ascending: false })
+    .order("games", { ascending: false })
+    .limit(pageSize);
+
+  if (error) throw error;
+
+  const wallets = (rows || []).map(r => (r.wallet || "").toLowerCase()).filter(Boolean);
+
+  // 2) 批量拿名称
+  let nameMap = {};
+  if (wallets.length) {
+    const { data: profs, error: pErr } = await supabase
+      .from("player_profiles")
+      .select("wallet,game_name")
+      .in("wallet", wallets);
+
+    if (pErr) throw pErr;
+
+    nameMap = Object.fromEntries((profs || []).map(p => [String(p.wallet).toLowerCase(), p.game_name]));
+  }
+
+  // 3) 合并 name
+  const out = (rows || []).map(r => ({
+    wallet: r.wallet,
+    game_name: nameMap[String(r.wallet).toLowerCase()] || null,
+    wins: r.wins,
+    loses: r.loses,
+    score: r.score,
+    games: r.games,
+    week_start: r.week_start
+  }));
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    ok: true,
+    weekStart: weekStart.toISOString(),
+    rows: out
+  }));
+}
 
     if (req.method === "POST" && path === "/api/roompool/add") {
       const { launchUrl } = await readJson(req);
