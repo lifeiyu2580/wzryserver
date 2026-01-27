@@ -787,7 +787,6 @@ async function claimRoomFromPool(matchId) {
 }
 
 
-
 async function handle(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") {
@@ -1193,38 +1192,38 @@ if (req.method === "GET" && path === "/api/match/history") {
   }));
 }
 
-    if (req.method === "POST" && path === "/api/roompool/add") {
-      const { launchUrl } = await readJson(req);
-      if (!launchUrl) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, error: "missing launchUrl" }));
-      }
+    // if (req.method === "POST" && path === "/api/roompool/add") {
+    //   const { launchUrl } = await readJson(req);
+    //   if (!launchUrl) {
+    //     res.writeHead(400, { "Content-Type": "application/json" });
+    //     return res.end(JSON.stringify({ ok: false, error: "missing launchUrl" }));
+    //   }
 
-      const b64 = parseGamedataFromLaunchUrl(String(launchUrl).trim());
-      const payloadStr = decodePayloadStr(b64);
+    //   const b64 = parseGamedataFromLaunchUrl(String(launchUrl).trim());
+    //   const payloadStr = decodePayloadStr(b64);
 
-      // 自动补齐两边
-      const payloadBlue = setCampid(payloadStr, "1");
-      const payloadRed  = setCampid(payloadStr, "2");
+    //   // 自动补齐两边
+    //   const payloadBlue = setCampid(payloadStr, "1");
+    //   const payloadRed  = setCampid(payloadStr, "2");
 
-      const launch_blue = buildLaunchUrlFromPayloadStr(payloadBlue);
-      const launch_red  = buildLaunchUrlFromPayloadStr(payloadRed);
+    //   const launch_blue = buildLaunchUrlFromPayloadStr(payloadBlue);
+    //   const launch_red  = buildLaunchUrlFromPayloadStr(payloadRed);
 
-      const ullRoomid = extractUllRoomid(payloadStr);
+    //   const ullRoomid = extractUllRoomid(payloadStr);
 
-      const { error } = await supabase.from("room_pool").insert({
-        ull_roomid: ullRoomid,
-        base_payload: payloadStr,
-        launch_blue,
-        launch_red,
-        status: "unused"
-      });
+    //   const { error } = await supabase.from("room_pool").insert({
+    //     ull_roomid: ullRoomid,
+    //     base_payload: payloadStr,
+    //     launch_blue,
+    //     launch_red,
+    //     status: "unused"
+    //   });
 
-      if (error) throw error;
+    //   if (error) throw error;
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, ullRoomid, launch_blue, launch_red }));
-    }
+    //   res.writeHead(200, { "Content-Type": "application/json" });
+    //   return res.end(JSON.stringify({ ok: true, ullRoomid, launch_blue, launch_red }));
+    // }
 
     // ---- state ----
     if (req.method === "GET" && path === "/api/state") {
