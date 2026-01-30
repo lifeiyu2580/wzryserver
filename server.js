@@ -2,6 +2,7 @@ import express from "express";
 
 const app = express();
 app.use(express.json());
+const CREATOR_WALLET = "0xa34082baa6241d691bc26535b22d8684a67bf0b9".toLowerCase();
 
 /**
  * 允许的 Origin 列表（逗号分隔）
@@ -78,6 +79,53 @@ app.post("/api/coin", async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+
+app.get("/api/latest-coin", async (req, res) => {
+  try {
+    const payload = {
+      query: `
+        query ProfileCreated($address: String!) {
+          profile(address: $address) {
+            address
+            created {
+              name
+              symbol
+              address
+              metadata { image }
+            }
+          }
+        }
+      `,
+      variables: { address: CREATOR_WALLET }
+    };
+
+    const r = await fetch("https://0pi75kmgw9.execute-api.eu-west-3.amazonaws.com/v1", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const json = await r.json();
+    const created = json?.data?.profile?.created || [];
+
+    if (!created.length) {
+      return res.status(404).json({ error: "no created coins" });
+    }
+
+    let latest = created[0];
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      creator: CREATOR_WALLET,
+      name: latest.name,
+      symbol: latest.symbol,
+      address: latest.address,
+      image: latest?.metadata?.image || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
