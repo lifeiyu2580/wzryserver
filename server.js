@@ -3,18 +3,52 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-// ===== 1. health：保活用 =====
+/** ========= CORS 配置：只放行你的前端域名 =========
+ * 1) 把 FRONTEND_ORIGIN 改成你的前端域名
+ *    - 本地开发: http://localhost:5173
+ *    - 线上: https://xxx.vercel.app 或 https://你的域名
+ */
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+
+function setCors(res, origin) {
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Methods", "POST,GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Credentials", "false");
+  // 缓存预检结果（可选）
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
+// 处理所有 OPTIONS 预检请求
+app.options("*", (req, res) => {
+  const origin = req.headers.origin;
+  if (origin && origin === FRONTEND_ORIGIN) {
+    setCors(res, origin);
+    return res.status(204).end();
+  }
+  // 不允许的来源
+  return res.status(403).end();
+});
+
+// 给所有响应都带上 CORS（仅允许指定域名）
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && origin === FRONTEND_ORIGIN) {
+    setCors(res, origin);
+  }
+  next();
+});
+
+/** ========= health：保活用 ========= */
 app.get("/health", (req, res) => {
   res.status(200).send("ok");
 });
 
-// ===== 2. flap GraphQL 代理 =====
+/** ========= flap GraphQL 代理 ========= */
 app.post("/api/coin", async (req, res) => {
   try {
     const { address } = req.body || {};
-    if (!address) {
-      return res.status(400).json({ error: "missing address" });
-    }
+    if (!address) return res.status(400).json({ error: "missing address" });
 
     const payload = {
       query: `
@@ -24,11 +58,7 @@ app.post("/api/coin", async (req, res) => {
               timestamp
               content
               tx
-              profile {
-                address
-                name
-                pfp
-              }
+              profile { address name pfp }
             }
           }
         }
@@ -49,25 +79,19 @@ app.post("/api/coin", async (req, res) => {
   }
 });
 
-// ===== 3. 启动 + 自 ping 保活 =====
+/** ========= Render 启动 + 自 ping ========= */
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log("API running on port", PORT);
+  console.log("CORS allowed origin:", FRONTEND_ORIGIN);
 
-  const SELF_URL = process.env.SELF_URL;
+  const SELF_URL = process.env.SELF_URL; // 例：https://xxx.onrender.com
   if (SELF_URL) {
     console.log("Self ping enabled:", SELF_URL);
-
     setInterval(() => {
-      fetch(`${SELF_URL}/health`)
-        .then(() => {
-          console.log("self ping ok");
-        })
-        .catch(() => {
-          console.log("self ping failed");
-        });
-    }, 5 * 60 * 1000); // 每 5 分钟 ping 一次
+      fetch(`${SELF_URL}/health`).catch(() => {});
+    }, 5 * 60 * 1000);
   } else {
     console.log("SELF_URL not set, self ping disabled");
   }
